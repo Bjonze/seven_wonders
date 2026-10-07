@@ -11,8 +11,10 @@ import numpy as np
 import torch
 
 from ..game import Game
-from .encoding import encode
+from .agent import evaluate_games
+from .encoding import SCORE_KEYS, encode
 from .model import PolicyValueNet
+from .priority import lower_priority
 
 
 def terminal_rewards(game: Game, mode: str) -> list[float]:
@@ -88,11 +90,12 @@ def collect(
     values = np.asarray(val_buf, dtype=np.float32)
     adv = np.zeros_like(values)
     ret = np.zeros_like(values)
-    final_scores = []
+    breakdowns = []
     for gi, g in enumerate(games):
         rewards = terminal_rewards(g, reward_mode)
-        final_scores.extend(g.scores())
         for seat in range(num_players):
+            b = g.score_breakdown(seat)
+            breakdowns.append([b[k] for k in SCORE_KEYS])
             idx = np.asarray(trajectories[gi][seat], dtype=np.int64)
             a, r = gae(values[idx], rewards[seat], gamma, lam)
             adv[idx] = a
@@ -106,14 +109,21 @@ def collect(
         "value": values,
         "adv": adv,
         "ret": ret,
-        "scores": np.asarray(final_scores, dtype=np.float32),
+        # one row per (game, seat), games in order: reshape to (games, players, keys)
+        "breakdowns": np.asarray(breakdowns, dtype=np.float32),
         "games": np.asarray([num_games]),
     }
 
 
+def _load(model: PolicyValueNet, weights: dict[str, np.ndarray]) -> None:
+    model.load_state_dict({k: torch.from_numpy(v) for k, v in weights.items()})
+
+
 def worker_main(conn, num_players: int, model_config: dict, reward_mode: str,
-                gamma: float, lam: float) -> None:
-    """Rollout worker process: receives weights, plays games, sends back the data."""
+                gamma: float, lam: float, priority: str | None = None) -> None:
+    """Worker process: receives weights, plays self-play or evaluation games, sends results."""
+    if priority:
+        lower_priority(priority)
     torch.set_num_threads(1)
     model = PolicyValueNet(**model_config)
     while True:
@@ -122,8 +132,17 @@ def worker_main(conn, num_players: int, model_config: dict, reward_mode: str,
             break
         if cmd == "collect":
             weights, seed, num_games = payload
-            model.load_state_dict({k: torch.from_numpy(v) for k, v in weights.items()})
+            _load(model, weights)
             conn.send(collect(model, num_games, num_players, seed, reward_mode, gamma, lam))
+        elif cmd == "evaluate":
+            weights, opponent, opponent_ckpt, game_ids, seed = payload
+            _load(model, weights)
+            opponent_model = None
+            if opponent_ckpt is not None:
+                opponent_config, opponent_weights = opponent_ckpt
+                opponent_model = PolicyValueNet(**opponent_config)
+                _load(opponent_model, opponent_weights)
+            conn.send(evaluate_games(model, opponent, game_ids, num_players, seed, opponent_model))
 
 
 __all__ = ["collect", "worker_main", "terminal_rewards", "gae"]

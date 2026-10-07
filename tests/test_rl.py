@@ -4,6 +4,7 @@ import torch
 
 from sevenwonders.bots import RandomBot
 from sevenwonders.game import Game
+from sevenwonders.rl.agent import evaluate_games, summarize
 from sevenwonders.rl.encoding import NUM_ACTIONS, encode, obs_dim
 from sevenwonders.rl.model import PolicyValueNet
 from sevenwonders.rl.rollout import collect, gae, terminal_rewards
@@ -50,3 +51,15 @@ def test_collect_shapes():
     for key in ("obs", "mask", "logp", "value", "adv", "ret"):
         assert len(data[key]) == n
     assert data["mask"][np.arange(n), data["action"]].all()  # only legal actions sampled
+    assert data["breakdowns"].shape == (3 * 4, 8)
+
+
+def test_evaluate_games_against_bots_and_policy():
+    torch.manual_seed(0)
+    model = PolicyValueNet(obs_dim(4), NUM_ACTIONS, hidden=64)
+    for opponent in ("greedy", "random"):
+        res = evaluate_games(model, opponent, [0, 1, 5], num_players=4)
+        assert res["win"].shape == (3,) and res["breakdown"].shape == (3, 8)
+    res = evaluate_games(model, "checkpoint", [2, 3], num_players=4, opponent_model=model)
+    summary = summarize(res)
+    assert 0.0 <= summary["win_rate"] <= 1.0 and "points_science" in summary

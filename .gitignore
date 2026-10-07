@@ -6,3 +6,4 @@ runs/
 checkpoints/
 *.pt
 logs/
+wandb/
