@@ -208,6 +208,10 @@ class Game:
             raise ValueError("need one wonder per player")
         self.players = [Player(i, w) for i, w in enumerate(wonders)]
         self.discard: list[Card] = []
+        # For statistics: (seat, "sold" | "leftover", age, turn) of each discard pile card,
+        # and (card, seat, how, age, turn) of the latest Halikarnassos pick
+        self.discard_origin: list[tuple[int, str, int, int]] = []
+        self.last_free_build: tuple | None = None
         self.hands: list[list[Card]] = [[] for _ in range(num_players)]
         self.age = 0
         self.turn = 0
@@ -229,6 +233,7 @@ class Game:
         g.rng.setstate(self.rng.getstate())
         g.players = [p.clone() for p in self.players]
         g.discard = list(self.discard)
+        g.discard_origin = list(self.discard_origin)
         g.hands = [list(h) for h in self.hands]
         g.active = list(self.active)
         g._babylon_queue = list(self._babylon_queue)
@@ -382,7 +387,8 @@ class Game:
         elif self.phase == BABYLON:
             seat = self.active[0]
             self._resolve_plays({seat: actions[seat]})
-            self.discard.extend(self.hands[seat])  # nothing left in practice
+            for card in self.hands[seat]:  # nothing left in practice
+                self._discard(card, seat, "leftover")
             self.hands[seat] = []
             self._babylon_queue.pop(0)
             self._continue()
@@ -391,7 +397,9 @@ class Game:
             action = actions[seat]
             if action.kind != BUILD or action.card.name in self.players[seat].names:
                 raise ValueError(f"illegal Halikarnassos action {action}")
-            self.discard.remove(action.card)
+            i = self.discard.index(action.card)
+            del self.discard[i]
+            self.last_free_build = (action.card, *self.discard_origin.pop(i))
             self.players[seat].add_card(action.card)
             self._card_income(seat, action.card)
             self._hali_queue.pop(0)
@@ -425,7 +433,7 @@ class Game:
             elif action.kind == WONDER:
                 stages.append((seat, p.add_stage(action.card)))
             else:
-                self.discard.append(action.card)
+                self._discard(action.card, seat, "sold")
                 p.coins += SELL_COINS
         for seat in range(self.n):
             self.players[seat].coins += transfers[seat]
@@ -438,6 +446,10 @@ class Game:
             if stage.effect == DISCARD_BUILD:
                 self._hali_queue.append(seat)
         self._cache.clear()
+
+    def _discard(self, card: Card, seat: int, how: str) -> None:
+        self.discard.append(card)
+        self.discard_origin.append((seat, how, self.age, self.turn))
 
     def _count(self, seat: int, targets, scope: str) -> int:
         seats = {SELF: (seat,), NEIGHBORS: (self.left(seat), self.right(seat)),
@@ -490,7 +502,8 @@ class Game:
             return
         if self.turn == TURNS_PER_AGE and not self._leftovers_done:
             for s in range(self.n):
-                self.discard.extend(self.hands[s])
+                for card in self.hands[s]:
+                    self._discard(card, s, "leftover")
                 self.hands[s] = []
             self._leftovers_done = True
         while self._hali_queue:
