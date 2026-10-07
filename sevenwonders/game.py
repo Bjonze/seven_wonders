@@ -176,6 +176,15 @@ class Player:
             for r in range(NUM_RESOURCES)
         )
 
+    def clone(self) -> Player:
+        p = Player.__new__(Player)
+        p.__dict__ = self.__dict__.copy()
+        for name in ("stage_cards", "city", "military", "color_counts", "science", "fixed",
+                     "tradeable_fixed", "choices", "tradeable_choices"):
+            setattr(p, name, list(getattr(self, name)))
+        p.names = set(self.names)
+        return p
+
 
 class Game:
     def __init__(
@@ -209,6 +218,23 @@ class Game:
         self._leftovers_done = False
         self._cache: dict = {}
         self._start_age(1)
+
+    def clone(self) -> Game:
+        """Independent copy of the game (cards and wonders are shared, they never change).
+
+        The random generator is copied too, so later deals are the same as in the original."""
+        g = Game.__new__(Game)
+        g.__dict__ = self.__dict__.copy()
+        g.rng = random.Random()
+        g.rng.setstate(self.rng.getstate())
+        g.players = [p.clone() for p in self.players]
+        g.discard = list(self.discard)
+        g.hands = [list(h) for h in self.hands]
+        g.active = list(self.active)
+        g._babylon_queue = list(self._babylon_queue)
+        g._hali_queue = list(self._hali_queue)
+        g._cache = dict(self._cache)
+        return g
 
     # -- neighbours ----------------------------------------------------------------------
     def left(self, seat: int) -> int:

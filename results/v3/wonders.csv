@@ -1,0 +1,15 @@
+wonder_side,win_rate,mean_score,seat_games
+Halikarnassos (night),0.40799,57.56223,2266
+Babylon (night),0.30756,55.12250,2302
+Ephesos (night),0.30631,56.01115,2331
+Rhodos (night),0.30362,55.81180,2322
+Halikarnassos (day),0.26725,53.91341,2275
+Babylon (day),0.26673,53.74296,2272
+Ephesos (day),0.25187,53.87164,2267
+Gizah (night),0.22220,53.74644,2248
+Alexandria (day),0.21098,52.61396,2422
+Alexandria (night),0.20603,52.02670,2172
+Gizah (day),0.20185,52.62210,2326
+Rhodos (day),0.19734,52.18182,2222
+Olympia (day),0.17942,51.47546,2221
+Olympia (night),0.16950,51.25573,2354
