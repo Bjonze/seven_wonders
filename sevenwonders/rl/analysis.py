@@ -19,7 +19,7 @@ import numpy as np
 import torch
 
 from ..game import BABYLON, BUILD, CHEAPEST, PLAY, SELL, Action, Game
-from .encoding import encode, uses_payment_choice
+from .encoding import encode, model_encoding
 from .model import PolicyValueNet
 
 OBS_FIELDS = ("card", "age", "turn", "seat", "game", "buildable", "built", "q_build", "q_sell",
@@ -42,7 +42,7 @@ def _forward(model: PolicyValueNet, encoded: list) -> tuple[torch.Tensor, torch.
 def observe(model: PolicyValueNet, seeds: list[int], num_players: int = 4,
             sample: bool = True, torch_seed: int = 0) -> dict[str, np.ndarray]:
     model.eval()
-    pc = uses_payment_choice(model.num_actions)
+    pc = model_encoding(model)
     generator = torch.Generator().manual_seed(torch_seed)
     games = [Game(num_players=num_players, seed=s) for s in seeds]
     rows: list[list[float]] = []
@@ -126,7 +126,7 @@ def play_forced(model: PolicyValueNet, seeds: list[int], card_name: str, card_ag
     same seeds is a paired, played-out measure of the card's value. Returns the seat's win
     share and whether the opportunity came up."""
     model.eval()
-    pc = uses_payment_choice(model.num_actions)
+    pc = model_encoding(model)
     games = [Game(num_players=num_players, seed=s) for s in seeds]
     forced_seat = [s % num_players for s in seeds]
     opportunity = np.zeros(len(games), dtype=np.float32)

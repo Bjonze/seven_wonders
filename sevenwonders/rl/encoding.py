@@ -10,11 +10,19 @@ Actions are indexed by card *name*. There are two layouts:
   * payment choice: index = card_id * 7 + slot, with slots 0-2 as above (cheapest payment)
     plus 3/4 = build paying left/right, 5/6 = wonder stage paying left/right
     (see PAY_LEFT / PAY_RIGHT in game.py).
-A model's layout follows from its number of outputs (NUM_ACTIONS or NUM_ACTIONS_PAY).
 During the Halikarnassos phase the "hand" is the discard pile and only builds are legal.
+
+What a model sees is described by an EncodingConfig, stored with the model:
+  * payment_choice: the 7-slot action layout above, plus features describing each payment
+  * hidden_discard: the discard pile is face down, as in the real game. A seat sees only the
+    cards it discarded itself and the size of the pile; Halikarnassos sees the whole pile
+    while it picks a card from it. Without this flag (models v1-v3) every seat saw the
+    whole pile all the time.
 """
 
 from __future__ import annotations
+
+from dataclasses import asdict, dataclass
 
 import numpy as np
 
@@ -53,22 +61,46 @@ HAND_FEATURES = {False: 3, True: 11}
 WONDER_FEATURES = {False: 2, True: 10}
 
 
-def global_features(payment_choice: bool = False) -> int:
+@dataclass(frozen=True)
+class EncodingConfig:
+    payment_choice: bool = False
+    hidden_discard: bool = False
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+
+def as_config(cfg: EncodingConfig | bool) -> EncodingConfig:
+    """Accept a config, or a bool meaning payment_choice (older call style)."""
+    return cfg if isinstance(cfg, EncodingConfig) else EncodingConfig(payment_choice=bool(cfg))
+
+
+def model_encoding(model) -> EncodingConfig:
+    """Encoding a model was trained with (older models only imply it by their output size)."""
+    enc = getattr(model, "encoding", None)
+    if enc:
+        return EncodingConfig(**enc)
+    return EncodingConfig(payment_choice=model.num_actions == NUM_ACTIONS_PAY)
+
+
+def global_features(cfg: EncodingConfig | bool = False) -> int:
+    cfg = as_config(cfg)
     return (
         3 + 7 + len(PHASES)   # age, turn (1-6, 7 = Babylon's extra card), phase
         + NUM_CARD_IDS        # hand counts
-        + NUM_CARD_IDS * HAND_FEATURES[payment_choice]
-        + WONDER_FEATURES[payment_choice]
-        + NUM_CARD_IDS        # discard pile counts
+        + NUM_CARD_IDS * HAND_FEATURES[cfg.payment_choice]
+        + WONDER_FEATURES[cfg.payment_choice]
+        + NUM_CARD_IDS        # discard pile counts (hidden_discard: own discards only)
+        + (1 if cfg.hidden_discard else 0)  # discard pile size
     )
 
 
-def obs_dim(num_players: int, payment_choice: bool = False) -> int:
-    return PLAYER_FEATURES * num_players + global_features(payment_choice)
+def obs_dim(num_players: int, cfg: EncodingConfig | bool = False) -> int:
+    return PLAYER_FEATURES * num_players + global_features(cfg)
 
 
-def num_actions(payment_choice: bool) -> int:
-    return NUM_ACTIONS_PAY if payment_choice else NUM_ACTIONS
+def num_actions(cfg: EncodingConfig | bool) -> int:
+    return NUM_ACTIONS_PAY if as_config(cfg).payment_choice else NUM_ACTIONS
 
 
 def uses_payment_choice(model_num_actions: int) -> bool:
@@ -119,11 +151,13 @@ def _payment_features(obs: np.ndarray, off: int, stride: int, cheapest, alternat
             obs[base + 2 * stride] = pay[2] / 5.0
 
 
-def encode(game: Game, seat: int, payment_choice: bool = False
+def encode(game: Game, seat: int, cfg: EncodingConfig | bool = False
            ) -> tuple[np.ndarray, np.ndarray, dict[int, Action]]:
     """Return (observation, legal-action mask, {action index: Action})."""
+    cfg = as_config(cfg)
+    payment_choice = cfg.payment_choice
     n = game.n
-    obs = np.zeros(obs_dim(n, payment_choice), dtype=np.float32)
+    obs = np.zeros(obs_dim(n, cfg), dtype=np.float32)
     off = 0
     for rel in range(n):
         p = game.players[(seat + rel) % n]
@@ -205,9 +239,18 @@ def encode(game: Game, seat: int, payment_choice: bool = False
                                     lambda p: game.wonder_payment(seat, p))
                 _payment_features(obs, off + 2, 1, wpay, alts)
     off += WONDER_FEATURES[payment_choice]
-    for card in game.discard:
-        obs[off + card.id] += 0.5
+    picking = game.phase == HALIKARNASSOS and seat in game.active
+    if cfg.hidden_discard and not picking:
+        for card, origin in zip(game.discard, game.discard_origin):
+            if origin[0] == seat:
+                obs[off + card.id] += 0.5
+    else:
+        for card in game.discard:
+            obs[off + card.id] += 0.5
     off += NUM_CARD_IDS
+    if cfg.hidden_discard:
+        obs[off] = len(game.discard) / 20.0
+        off += 1
     assert off == obs.shape[0]
 
     mask = np.zeros(num_actions(payment_choice), dtype=bool)
@@ -220,4 +263,5 @@ def encode(game: Game, seat: int, payment_choice: bool = False
 
 
 __all__ = ["encode", "obs_dim", "num_actions", "uses_payment_choice", "action_index",
-           "action_kind_and_pay", "NUM_ACTIONS", "NUM_ACTIONS_PAY"]
+           "action_kind_and_pay", "EncodingConfig", "as_config", "model_encoding",
+           "NUM_ACTIONS", "NUM_ACTIONS_PAY"]

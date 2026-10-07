@@ -9,7 +9,7 @@ import torch
 
 from ..bots import Bot, GreedyBot, RandomBot
 from ..runner import play_game
-from .encoding import SCORE_KEYS, encode, uses_payment_choice
+from .encoding import SCORE_KEYS, encode, model_encoding
 from .model import PolicyValueNet
 
 
@@ -18,13 +18,13 @@ class PolicyBot(Bot):
 
     def __init__(self, model: PolicyValueNet, greedy: bool = True, seed: int | None = None):
         self.model = model
-        self.payment_choice = uses_payment_choice(model.num_actions)
+        self.encoding = model_encoding(model)
         self.greedy = greedy
         self.generator = torch.Generator().manual_seed(seed if seed is not None else 0)
 
     @torch.no_grad()
     def act(self, game, seat, legal):
-        obs, mask, actions = encode(game, seat, self.payment_choice)
+        obs, mask, actions = encode(game, seat, self.encoding)
         logits, _ = self.model(torch.from_numpy(obs)[None], torch.from_numpy(mask)[None])
         if self.greedy:
             index = int(logits[0].argmax())
