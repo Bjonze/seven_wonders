@@ -20,6 +20,19 @@ python scripts/simulate.py --games 2000                      # 4 greedy bots
 python scripts/simulate.py --bots greedy,random,random,random
 ```
 
+## Training
+```bash
+python scripts/train.py --run v1 --iterations 300
+tensorboard --logdir runs
+```
+One shared policy plays every seat (self-play). Games are played on CPU worker processes and
+the PPO update runs on the GPU. Every `--eval-every` iterations the policy plays one seat
+against three greedy bots and against three random bots, and logs its win rate. Checkpoints
+are saved to `checkpoints/<run>/`. Use `--resume checkpoints/<run>/latest.pt` to continue a
+run.
+
+Throughput is limited by the CPU (the Python game engine), at roughly 100 games/s per core.
+
 ## Layout
 - `sevenwonders/cards.py`: Age cards and guilds (2nd edition)
 - `sevenwonders/wonders.py`: all 14 wonder sides
@@ -27,10 +40,16 @@ python scripts/simulate.py --bots greedy,random,random,random
 - `sevenwonders/game.py`: game state, legal actions, turn flow, scoring
 - `sevenwonders/bots.py`: random and greedy baseline bots
 - `sevenwonders/runner.py`: play full games, optionally logging every decision
+- `sevenwonders/rl/encoding.py`: game state → observation vector + legal-action mask
+- `sevenwonders/rl/model.py`: policy/value MLP
+- `sevenwonders/rl/rollout.py`: batched self-play collection, rewards, GAE
+- `sevenwonders/rl/ppo.py`: PPO update
+- `sevenwonders/rl/agent.py`: `PolicyBot` and evaluation against baseline bots
+- `scripts/train.py`: training entry point
 - `DATA_NOTES.md`: data sources, uncertain entries, rule interpretations
 
 ## Roadmap
 1. ~~Rules engine, card data, tests~~
 2. ~~Baseline bots~~
-3. RL environment (observation encoding, action masking) and PPO self-play on the GPU
+3. ~~RL environment (observation encoding, action masking) and PPO self-play on the GPU~~ (v1 done; tuning ongoing)
 4. Card analysis: pick rates, picked-vs-passed win rates, the value network's preferences, forced-pick experiments

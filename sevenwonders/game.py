@@ -99,6 +99,7 @@ class Player:
         self.free_first_of_age = False
         self.free_last_of_age = False
         self.play_last_card = False
+        self.price_left = self.price_right = (2,) * NUM_RESOURCES
 
     # -- state changes -------------------------------------------------------------------
     def add_card(self, card: Card) -> None:
@@ -119,9 +120,12 @@ class Player:
             self.choices.append(card.choice)
             if card.tradeable:
                 self.tradeable_choices.append(card.choice)
-        self.discount_left_brown |= card.discount_left_brown
-        self.discount_right_brown |= card.discount_right_brown
-        self.discount_grey |= card.discount_grey
+        if card.discount_left_brown or card.discount_right_brown or card.discount_grey:
+            self.discount_left_brown |= card.discount_left_brown
+            self.discount_right_brown |= card.discount_right_brown
+            self.discount_grey |= card.discount_grey
+            self.price_left = self._prices(self.discount_left_brown)
+            self.price_right = self._prices(self.discount_right_brown)
 
     def add_stage(self, card: Card) -> Stage:
         stage = self.wonder.stages[self.stages_built]
@@ -153,9 +157,8 @@ class Player:
             return None
         return self.wonder.stages[self.stages_built]
 
-    def prices_from(self, side: str) -> tuple[int, ...]:
-        """Coins per unit when buying from the left/right neighbour."""
-        brown_discount = self.discount_left_brown if side == "left" else self.discount_right_brown
+    def _prices(self, brown_discount: bool) -> tuple[int, ...]:
+        """Coins per unit when buying from a neighbour."""
         return tuple(
             1 if (brown_discount if IS_BROWN[r] else self.discount_grey) else 2
             for r in range(NUM_RESOURCES)
@@ -215,7 +218,7 @@ class Game:
             cost, p.fixed, p.choices,
             lp.tradeable_fixed, lp.tradeable_choices,
             rp.tradeable_fixed, rp.tradeable_choices,
-            p.prices_from("left"), p.prices_from("right"),
+            p.price_left, p.price_right,
         )
 
     def is_free(self, seat: int, card: Card) -> bool:

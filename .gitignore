@@ -5,3 +5,4 @@ research/
 runs/
 checkpoints/
 *.pt
+logs/
