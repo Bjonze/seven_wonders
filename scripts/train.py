@@ -46,7 +46,7 @@ from sevenwonders.rl.encoding import (  # noqa: E402
 )
 from sevenwonders.rl.model import PolicyValueNet  # noqa: E402
 from sevenwonders.rl.ppo import PPOConfig, ppo_update  # noqa: E402
-from sevenwonders.rl.priority import lower_priority  # noqa: E402
+from sevenwonders.rl.priority import keep_awake, lower_priority  # noqa: E402
 from sevenwonders.rl.rollout import collect, worker_main  # noqa: E402
 from sevenwonders.wonders import WONDERS  # noqa: E402
 
@@ -63,6 +63,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--games-per-worker", type=int, default=128)
     p.add_argument("--low-priority", action="store_true",
                    help="run below normal priority so other programs (games) get the CPU first")
+    p.add_argument("--keep-awake", action="store_true",
+                   help="stop Windows from idle-sleeping while training runs")
     # model and observation
     p.add_argument("--arch", choices=["mlp", "resmlp"], default="mlp")
     p.add_argument("--hidden", type=int, default=512)
@@ -255,6 +257,8 @@ def main() -> None:
     args, ckpt = parse_args()
     if args.low_priority:
         lower_priority("below_normal")
+    if args.keep_awake:
+        keep_awake()
     torch.set_num_threads(2)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     torch.manual_seed(args.seed)
