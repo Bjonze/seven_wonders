@@ -5,7 +5,7 @@ from __future__ import annotations
 import random
 
 from .cards import BROWN, CARD_BY_ID, GREEN, GREY, PURPLE, RED, STAGE, WILD, YELLOW, Card
-from .game import BUILD, SELL, WONDER, Action, Game, science_points
+from .game import BUILD, SELL, SIDE, WONDER, Action, Game, science_points
 from .wonders import (
     BROWN_CHOICE, DISCARD_BUILD, FREE_FIRST_COLOR, FREE_FIRST_OF_AGE, FREE_LAST_OF_AGE,
     GREY_CHOICE, PLAY_LAST_CARD, SCIENCE_WILD,
@@ -45,6 +45,8 @@ class GreedyBot(Bot):
         self.noise = noise
 
     def act(self, game, seat, legal):
+        if game.phase == SIDE:
+            return self.rng.choice(legal)
         return max(legal, key=lambda a: self.value(game, seat, a) + self.rng.random() * self.noise)
 
     # ------------------------------------------------------------------------------------

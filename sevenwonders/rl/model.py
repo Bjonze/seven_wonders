@@ -83,3 +83,24 @@ def model_from_checkpoint(checkpoint: dict, device: str = "cpu") -> PolicyValueN
 def load_model(path: str, device: str = "cpu") -> PolicyValueNet:
     checkpoint = torch.load(path, map_location=device, weights_only=False)
     return model_from_checkpoint(checkpoint, device)
+
+
+@torch.no_grad()
+def warm_start(model: PolicyValueNet, source: dict[str, torch.Tensor]) -> None:
+    """Copy a state dict into `model`. Tensors that grew because inputs or actions were
+    appended at the end get the old values in their leading slice; new input columns are
+    set to 0 (no effect until trained) and new output rows keep their initialisation."""
+    target = model.state_dict()
+    for name, value in source.items():
+        if name not in target:
+            raise ValueError(f"unexpected parameter {name}")
+        new = target[name]
+        if new.shape == value.shape:
+            new.copy_(value)
+        elif new.dim() == value.dim() and all(a >= b for a, b in zip(new.shape, value.shape)):
+            if new.dim() == 2 and new.shape[1] > value.shape[1]:
+                new[:, value.shape[1]:] = 0.0
+            new[tuple(slice(0, s) for s in value.shape)] = value
+        else:
+            raise ValueError(f"{name}: {tuple(value.shape)} does not fit {tuple(new.shape)}")
+    model.load_state_dict(target)

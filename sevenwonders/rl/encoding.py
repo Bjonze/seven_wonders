@@ -18,6 +18,11 @@ What a model sees is described by an EncodingConfig, stored with the model:
     cards it discarded itself and the size of the pile; Halikarnassos sees the whole pile
     while it picks a card from it. Without this flag (models v1-v3) every seat saw the
     whole pile all the time.
+  * side_choice: the model also picks its wonder side in the SIDE phase. Adds two actions
+    (Day, Night) after all others and one feature (the "choosing sides" flag) at the end of
+    the observation, so an older model's weights carry over unchanged. While sides are
+    being chosen, each player's wonder shows as half Day, half Night.
+Models without side_choice get a random side (see `random_side`).
 """
 
 from __future__ import annotations
@@ -28,11 +33,15 @@ import numpy as np
 
 from ..cards import NUM_CARD_IDS, NUM_COLORS
 from ..game import (
-    BABYLON, BUILD, CHEAPEST, HALIKARNASSOS, NUM_ACTION_KINDS, PAY_LEFT, PAY_RIGHT, PLAY, WONDER,
-    Action, Game,
+    BABYLON, BUILD, CHEAPEST, CHOOSE_SIDE, HALIKARNASSOS, NUM_ACTION_KINDS, PAY_LEFT, PAY_RIGHT,
+    PLAY, SIDE, SIDES, WONDER, Action, Game, SideChoice,
 )
 from ..resources import NUM_RESOURCES
-from ..wonders import MAX_STAGES, NUM_WONDER_SIDES
+from ..wonders import MAX_STAGES, NUM_WONDER_SIDES, WONDERS
+
+# wonder name -> (day side id, night side id)
+_SIDE_IDS = {name: tuple(next(w.id for w in WONDERS if w.name == name and w.side == s) for s in SIDES)
+             for name in {w.name for w in WONDERS}}
 
 NUM_ACTIONS = NUM_CARD_IDS * NUM_ACTION_KINDS
 SLOTS_PAY = 7
@@ -65,9 +74,15 @@ WONDER_FEATURES = {False: 2, True: 10}
 class EncodingConfig:
     payment_choice: bool = False
     hidden_discard: bool = False
+    side_choice: bool = False
 
     def to_dict(self) -> dict:
         return asdict(self)
+
+
+def random_side(rng) -> SideChoice:
+    """Side pick for bots that can't choose (old models, baseline bots)."""
+    return SideChoice(rng.choice(SIDES))
 
 
 def as_config(cfg: EncodingConfig | bool) -> EncodingConfig:
@@ -92,6 +107,7 @@ def global_features(cfg: EncodingConfig | bool = False) -> int:
         + WONDER_FEATURES[cfg.payment_choice]
         + NUM_CARD_IDS        # discard pile counts (hidden_discard: own discards only)
         + (1 if cfg.hidden_discard else 0)  # discard pile size
+        + (1 if cfg.side_choice else 0)     # choosing sides
     )
 
 
@@ -99,16 +115,24 @@ def obs_dim(num_players: int, cfg: EncodingConfig | bool = False) -> int:
     return PLAYER_FEATURES * num_players + global_features(cfg)
 
 
+def _card_actions(cfg: EncodingConfig) -> int:
+    return NUM_ACTIONS_PAY if cfg.payment_choice else NUM_ACTIONS
+
+
 def num_actions(cfg: EncodingConfig | bool) -> int:
-    return NUM_ACTIONS_PAY if as_config(cfg).payment_choice else NUM_ACTIONS
+    cfg = as_config(cfg)
+    return _card_actions(cfg) + (len(SIDES) if cfg.side_choice else 0)
 
 
 def uses_payment_choice(model_num_actions: int) -> bool:
     return model_num_actions == NUM_ACTIONS_PAY
 
 
-def action_index(action: Action, payment_choice: bool) -> int:
-    if not payment_choice:
+def action_index(action: Action | SideChoice, cfg: EncodingConfig | bool) -> int:
+    cfg = as_config(cfg)
+    if isinstance(action, SideChoice):
+        return _card_actions(cfg) + SIDES.index(action.side)
+    if not cfg.payment_choice:
         return action.index
     if action.pay == CHEAPEST:
         slot = action.kind
@@ -117,15 +141,19 @@ def action_index(action: Action, payment_choice: bool) -> int:
     return action.card.id * SLOTS_PAY + slot
 
 
-def action_kind_and_pay(indices: np.ndarray, payment_choice: bool) -> tuple[np.ndarray, np.ndarray]:
-    """Decode flat action indices into (kind, payment option) arrays."""
-    if not payment_choice:
-        return indices % NUM_ACTION_KINDS, np.zeros_like(indices)
-    slot = indices % SLOTS_PAY
-    basic = slot < 3
-    kind = np.where(basic, slot, (slot - 3) // 2)
-    pay = np.where(basic, CHEAPEST, PAY_LEFT + (slot - 3) % 2)
-    return kind, pay
+def action_kind_and_pay(indices: np.ndarray, cfg: EncodingConfig | bool) -> tuple[np.ndarray, np.ndarray]:
+    """Decode flat action indices into (kind, payment option) arrays (kind CHOOSE_SIDE for
+    side picks)."""
+    cfg = as_config(cfg)
+    side = indices >= _card_actions(cfg)
+    if not cfg.payment_choice:
+        kind, pay = indices % NUM_ACTION_KINDS, np.zeros_like(indices)
+    else:
+        slot = indices % SLOTS_PAY
+        basic = slot < 3
+        kind = np.where(basic, slot, (slot - 3) // 2)
+        pay = np.where(basic, CHEAPEST, PAY_LEFT + (slot - 3) % 2)
+    return np.where(side, CHOOSE_SIDE, kind), np.where(side, CHEAPEST, pay)
 
 
 def _scores(game: Game, seat: int) -> dict[str, int]:
@@ -156,6 +184,9 @@ def encode(game: Game, seat: int, cfg: EncodingConfig | bool = False
     """Return (observation, legal-action mask, {action index: Action})."""
     cfg = as_config(cfg)
     payment_choice = cfg.payment_choice
+    choosing = game.phase == SIDE
+    if choosing and not cfg.side_choice:
+        raise ValueError("this encoding cannot choose sides; use random_side()")
     n = game.n
     obs = np.zeros(obs_dim(n, cfg), dtype=np.float32)
     off = 0
@@ -164,7 +195,11 @@ def encode(game: Game, seat: int, cfg: EncodingConfig | bool = False
         for card in p.city:
             obs[off + card.id] = 1.0
         off += NUM_CARD_IDS
-        obs[off + p.wonder.id] = 1.0
+        if choosing:  # side not known yet
+            for side_id in _SIDE_IDS[p.wonder.name]:
+                obs[off + side_id] = 0.5
+        else:
+            obs[off + p.wonder.id] = 1.0
         off += NUM_WONDER_SIDES
         obs[off + p.stages_built] = 1.0
         off += MAX_STAGES + 1
@@ -197,16 +232,15 @@ def encode(game: Game, seat: int, cfg: EncodingConfig | bool = False
             obs[off + i] = scores[key] / (50.0 if key == "total" else 15.0)
         off += len(SCORE_KEYS)
 
-    obs[off + game.age - 1] = 1.0
-    off += 3
-    turn = 7 if game.phase == BABYLON else game.turn
-    obs[off + turn - 1] = 1.0
-    off += 7
-    obs[off + PHASES.index(game.phase)] = 1.0
-    off += len(PHASES)
+    if not choosing:
+        obs[off + game.age - 1] = 1.0
+        turn = 7 if game.phase == BABYLON else game.turn
+        obs[off + 3 + turn - 1] = 1.0
+        obs[off + 10 + PHASES.index(game.phase)] = 1.0
+    off += 3 + 7 + len(PHASES)
 
     legal = game.legal_actions(seat, payment_choice)
-    legal_keys = {(a.card.id, a.kind, a.pay) for a in legal}
+    legal_keys = {(a.card.id, a.kind, a.pay) for a in legal if not choosing}
 
     def alternatives(card_id: int, kind: int, payment_fn) -> list:
         return [payment_fn(pay) if (card_id, kind, pay) in legal_keys else None
@@ -229,7 +263,7 @@ def encode(game: Game, seat: int, cfg: EncodingConfig | bool = False
                                         lambda p, c=card: game.build_payment(seat, c, p))
                     _payment_features(obs, off + 3 * NUM_CARD_IDS + card.id, NUM_CARD_IDS, pay, alts)
     off += NUM_CARD_IDS * HAND_FEATURES[payment_choice]
-    if game.phase != HALIKARNASSOS:
+    if game.phase not in (HALIKARNASSOS, SIDE):
         wpay = game.wonder_payment(seat)
         if wpay is not None:
             obs[off] = 1.0
@@ -251,17 +285,20 @@ def encode(game: Game, seat: int, cfg: EncodingConfig | bool = False
     if cfg.hidden_discard:
         obs[off] = len(game.discard) / 20.0
         off += 1
+    if cfg.side_choice:
+        obs[off] = float(choosing)
+        off += 1
     assert off == obs.shape[0]
 
-    mask = np.zeros(num_actions(payment_choice), dtype=bool)
-    actions: dict[int, Action] = {}
+    mask = np.zeros(num_actions(cfg), dtype=bool)
+    actions: dict[int, Action | SideChoice] = {}
     for action in legal:
-        index = action_index(action, payment_choice)
+        index = action_index(action, cfg)
         mask[index] = True
         actions[index] = action
     return obs, mask, actions
 
 
 __all__ = ["encode", "obs_dim", "num_actions", "uses_payment_choice", "action_index",
-           "action_kind_and_pay", "EncodingConfig", "as_config", "model_encoding",
+           "action_kind_and_pay", "EncodingConfig", "as_config", "model_encoding", "random_side",
            "NUM_ACTIONS", "NUM_ACTIONS_PAY"]

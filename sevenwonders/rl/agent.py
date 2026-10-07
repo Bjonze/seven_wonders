@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import random
 from collections.abc import Iterable
 
 import numpy as np
@@ -9,7 +10,8 @@ import torch
 
 from ..bots import Bot, GreedyBot, RandomBot
 from ..runner import play_game
-from .encoding import SCORE_KEYS, encode, model_encoding
+from ..game import SIDE
+from .encoding import SCORE_KEYS, encode, model_encoding, random_side
 from .model import PolicyValueNet
 
 
@@ -21,9 +23,12 @@ class PolicyBot(Bot):
         self.encoding = model_encoding(model)
         self.greedy = greedy
         self.generator = torch.Generator().manual_seed(seed if seed is not None else 0)
+        self.rng = random.Random(seed)
 
     @torch.no_grad()
     def act(self, game, seat, legal):
+        if game.phase == SIDE and not self.encoding.side_choice:
+            return random_side(self.rng)
         obs, mask, actions = encode(game, seat, self.encoding)
         logits, _ = self.model(torch.from_numpy(obs)[None], torch.from_numpy(mask)[None])
         if self.greedy:
@@ -39,7 +44,8 @@ OPPONENTS = {"greedy": GreedyBot, "random": RandomBot}
 
 def evaluate_games(model: PolicyValueNet, opponent: str, game_ids: Iterable[int],
                    num_players: int = 4, seed: int = 10_000,
-                   opponent_model: PolicyValueNet | None = None) -> dict[str, np.ndarray]:
+                   opponent_model: PolicyValueNet | None = None,
+                   choose_sides: bool = False) -> dict[str, np.ndarray]:
     """Play the policy in one seat (rotating with the game id) against `opponent` bots.
 
     `opponent` is "greedy", "random", or "checkpoint" (then `opponent_model` plays the other
@@ -54,7 +60,7 @@ def evaluate_games(model: PolicyValueNet, opponent: str, game_ids: Iterable[int]
         else:
             bots = [OPPONENTS[opponent](seed=seed + g * num_players + i) for i in range(num_players)]
         bots[seat] = PolicyBot(model)
-        result = play_game(bots, num_players=num_players, seed=seed + g)
+        result = play_game(bots, num_players=num_players, seed=seed + g, choose_sides=choose_sides)
         wins.append(1.0 / len(result.winners) if seat in result.winners else 0.0)
         others = [s for i, s in enumerate(result.scores) if i != seat]
         margins.append(result.scores[seat] - max(others))
@@ -81,5 +87,6 @@ def summarize(results: dict[str, np.ndarray]) -> dict[str, float]:
 
 def evaluate(model: PolicyValueNet, opponent: str = "greedy", games: int = 200,
              num_players: int = 4, seed: int = 10_000,
-             opponent_model: PolicyValueNet | None = None) -> dict[str, float]:
-    return summarize(evaluate_games(model, opponent, range(games), num_players, seed, opponent_model))
+             opponent_model: PolicyValueNet | None = None, choose_sides: bool = False) -> dict[str, float]:
+    return summarize(evaluate_games(model, opponent, range(games), num_players, seed, opponent_model,
+                                    choose_sides))

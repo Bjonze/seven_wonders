@@ -4,6 +4,10 @@
         --payment-choice --hidden-discard --arch resmlp --hidden 1024 --layers 3 \
         --pool-init checkpoints/v3/latest.pt --eval-checkpoint checkpoints/v3/latest.pt
 
+Fine-tune from an earlier model; inputs/outputs it lacks (e.g. side choice) start at zero:
+
+    python scripts/train.py --run v5a --init checkpoints/v4/latest.pt --side-choice ...
+
 Continue after an interruption (settings, optimizer, opponent pool, best score and wandb run
 all come from the checkpoint; options given on the command line override them):
 
@@ -39,12 +43,12 @@ from torch.utils.tensorboard import SummaryWriter
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from sevenwonders.game import PAY_LEFT, PAY_RIGHT  # noqa: E402
+from sevenwonders.game import CHOOSE_SIDE, PAY_LEFT, PAY_RIGHT  # noqa: E402
 from sevenwonders.rl.agent import evaluate_games, summarize  # noqa: E402
 from sevenwonders.rl.encoding import (  # noqa: E402
     SCORE_KEYS, EncodingConfig, action_kind_and_pay, num_actions, obs_dim,
 )
-from sevenwonders.rl.model import PolicyValueNet  # noqa: E402
+from sevenwonders.rl.model import PolicyValueNet, warm_start  # noqa: E402
 from sevenwonders.rl.ppo import PPOConfig, ppo_update  # noqa: E402
 from sevenwonders.rl.priority import keep_awake, lower_priority  # noqa: E402
 from sevenwonders.rl.rollout import collect, worker_main  # noqa: E402
@@ -73,6 +77,12 @@ def build_parser() -> argparse.ArgumentParser:
                    help="let the policy choose whom to pay for resources (cheapest / pay-left / pay-right)")
     p.add_argument("--hidden-discard", action="store_true",
                    help="discard pile is face down: a seat only sees its own discards and the pile size")
+    p.add_argument("--side-choice", action="store_true",
+                   help="players pick their wonder side (Day/Night) at the start, as in the real game")
+    p.add_argument("--repeat-frac", type=float, default=0.0,
+                   help="share of training games dealt with repeated wonders (training variant)")
+    p.add_argument("--init", default=None,
+                   help="start from this checkpoint's weights; new inputs/outputs (e.g. side choice) start at 0")
     # PPO
     p.add_argument("--reward", choices=["win", "rank"], default="win")
     p.add_argument("--gamma", type=float, default=1.0)
@@ -89,6 +99,9 @@ def build_parser() -> argparse.ArgumentParser:
                    help="share of training games where 1-3 seats are played by a pool opponent")
     p.add_argument("--pool-every", type=int, default=50, help="add a snapshot of the learner every N iterations")
     p.add_argument("--pool-size", type=int, default=10, help="max learner snapshots in the pool")
+    p.add_argument("--pool-prioritize", type=float, default=0.0,
+                   help="0 = pick pool opponents uniformly; 1 = by difficulty only "
+                        "(weight (1 - learner win rate vs. it)^2); in between = mix")
     # evaluation and checkpoints
     p.add_argument("--eval-every", type=int, default=25)
     p.add_argument("--eval-games", type=int, default=400, help="games per evaluation opponent")
@@ -141,17 +154,31 @@ def atomic_save(obj, path: Path) -> None:
 class OpponentPool:
     """Frozen opponents: fixed checkpoints (--pool-init) plus rolling learner snapshots."""
 
-    def __init__(self, directory: Path, max_snapshots: int):
+    def __init__(self, directory: Path, max_snapshots: int, prioritize: float = 0.0):
         self.directory = directory
         self.max_snapshots = max_snapshots
-        self.entries: list[dict] = []  # {"id", "path", "fixed"}
+        self.prioritize = prioritize
+        self.entries: list[dict] = []  # {"id", "path", "fixed", "win_rate"}
         self._weights: dict[str, tuple[dict, dict]] = {}  # id -> (config, numpy weights)
         self._sent: dict[int, set[str]] = {}  # worker -> ids it has cached
 
-    def add(self, entry_id: str, path: Path, fixed: bool) -> None:
+    def record(self, opponent_index: np.ndarray, learner_win: np.ndarray) -> None:
+        """Update each opponent's running learner win rate (per learner seat; 0.25 = even)."""
+        for i, e in enumerate(self.entries):
+            wins = learner_win[opponent_index == i]
+            if len(wins):
+                e["win_rate"] = 0.9 * e.get("win_rate", 0.25) + 0.1 * float(wins.mean())
+
+    def sampling_weights(self) -> list[float]:
+        n = len(self.entries)
+        hard = [(1.0 - e.get("win_rate", 0.25)) ** 2 for e in self.entries]
+        total = sum(hard) or 1.0
+        return [(1 - self.prioritize) / n + self.prioritize * h / total for h in hard]
+
+    def add(self, entry_id: str, path: Path, fixed: bool, win_rate: float = 0.25) -> None:
         ckpt = torch.load(path, map_location="cpu", weights_only=False)
         self._weights[entry_id] = (ckpt["model_config"], {k: v.numpy() for k, v in ckpt["model"].items()})
-        self.entries.append({"id": entry_id, "path": str(path), "fixed": fixed})
+        self.entries.append({"id": entry_id, "path": str(path), "fixed": fixed, "win_rate": win_rate})
 
     def snapshot(self, model: PolicyValueNet, iteration: int) -> None:
         path = self.directory / f"iter_{iteration:05d}.pt"
@@ -225,8 +252,10 @@ class Logger:
 
 
 def selfplay_metrics(data: dict[str, np.ndarray], num_players: int,
-                     payment_choice: bool) -> dict[str, float]:
-    kind, pay = action_kind_and_pay(data["action"], payment_choice)
+                     enc: EncodingConfig) -> dict[str, float]:
+    kind, pay = action_kind_and_pay(data["action"], enc)
+    card_moves = kind != CHOOSE_SIDE
+    kind, pay = kind[card_moves], pay[card_moves]
     kinds = np.bincount(kind, minlength=3) / len(kind)
     builds = kind != 2
     out = {
@@ -250,6 +279,7 @@ def selfplay_metrics(data: dict[str, np.ndarray], num_players: int,
     if len(data["pool_win"]):
         out["league/win_rate_vs_pool"] = float(data["pool_win"].mean())
     out["league/learner_seats_in_pool_games"] = float(len(data["pool_win"]))
+    out["selfplay/repeated_wonder_games"] = float(data["repeated_games"].sum())
     return out
 
 
@@ -263,12 +293,13 @@ def main() -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     torch.manual_seed(args.seed)
 
-    enc = EncodingConfig(payment_choice=args.payment_choice, hidden_discard=args.hidden_discard)
+    enc = EncodingConfig(payment_choice=args.payment_choice, hidden_discard=args.hidden_discard,
+                         side_choice=args.side_choice)
     model = PolicyValueNet(obs_dim(args.players, enc), num_actions(enc), args.hidden, args.arch,
                            args.layers, enc.to_dict()).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, eps=1e-5)
     ckpt_dir = ROOT / "checkpoints" / args.run
-    pool = OpponentPool(ckpt_dir / "pool", args.pool_size)
+    pool = OpponentPool(ckpt_dir / "pool", args.pool_size, args.pool_prioritize)
     start, total_games, wandb_id = 0, 0, None
     best = {"metric": args.best_metric, "value": -1.0, "iteration": -1}
     if ckpt is not None:
@@ -279,13 +310,15 @@ def main() -> None:
         wandb_id = ckpt.get("wandb_id")
         best = ckpt.get("best", best)
         for e in ckpt.get("pool", []):
-            pool.add(e["id"], Path(e["path"]), e["fixed"])
+            pool.add(e["id"], Path(e["path"]), e["fixed"], e.get("win_rate", 0.25))
         rng = ckpt.get("rng")
         if rng:
             torch.set_rng_state(rng["torch"])
             np.random.set_state(rng["numpy"])
             random.setstate(rng["python"])
     else:
+        if args.init:
+            warm_start(model, torch.load(args.init, map_location="cpu", weights_only=False)["model"])
         for path in args.pool_init:
             pool.add(Path(path).parent.name, Path(path), fixed=True)
     cfg = PPOConfig(lr=args.lr, epochs=args.epochs, minibatch=args.minibatch, ent_coef=args.ent_coef)
@@ -332,10 +365,11 @@ def main() -> None:
             if opponent_ckpt is not None:
                 ref_model = PolicyValueNet(**opponent_ckpt[0])
                 ref_model.load_state_dict({k: torch.from_numpy(v) for k, v in opponent_ckpt[1].items()})
-            return summarize(evaluate_games(cpu_model, opponent_kind, ids, args.players, EVAL_SEED, ref_model))
+            return summarize(evaluate_games(cpu_model, opponent_kind, ids, args.players, EVAL_SEED, ref_model,
+                                            args.side_choice))
         chunks = [ids[w::len(workers)] for w in range(len(workers))]
         for (conn, _), chunk in zip(workers, chunks):
-            conn.send(("evaluate", (weights, opponent_kind, opponent_ckpt, chunk, EVAL_SEED)))
+            conn.send(("evaluate", (weights, opponent_kind, opponent_ckpt, chunk, EVAL_SEED, args.side_choice)))
         return summarize(concat([conn.recv() for conn, _ in workers]))
 
     def state(iteration: int) -> dict:
@@ -377,15 +411,18 @@ def main() -> None:
             t0 = time.time()
             weights = numpy_weights(model)
             seed = args.seed + it * 1_000_003
+            options = {"pool_frac": args.pool_frac, "opponent_weights": pool.sampling_weights() or None,
+                       "choose_sides": args.side_choice, "repeat_frac": args.repeat_frac}
             if workers:
                 for w, (conn, _) in enumerate(workers):
                     conn.send(("collect", (weights, seed + w * 10_007, args.games_per_worker,
-                                           pool.payload(w), args.pool_frac)))
+                                           pool.payload(w), options)))
                 data = concat([conn.recv() for conn, _ in workers])
             else:
                 cpu_model.load_state_dict(model.state_dict())
                 data = collect(cpu_model, args.games_per_worker, args.players, seed, args.reward,
-                               args.gamma, args.lam, pool.models(), args.pool_frac)
+                               args.gamma, args.lam, pool.models(), **options)
+            pool.record(data["pool_opponent"], data["pool_win"])
             t_collect = time.time() - t0
 
             t1 = time.time()
@@ -408,7 +445,10 @@ def main() -> None:
                 "progress/hours": (time.time() - run_start) / 3600,
                 "league/pool_size": float(len(pool.entries)),
             })
-            metrics.update(selfplay_metrics(data, args.players, args.payment_choice))
+            metrics.update(selfplay_metrics(data, args.players, enc))
+            for e in pool.entries:
+                if e["fixed"]:
+                    metrics[f"league/win_rate_vs_{e['id']}"] = e["win_rate"]
             wonder_wins.append(data["win"])
             wonder_ids.append(data["wonder"])
             log.metrics(metrics, it)
@@ -434,6 +474,13 @@ def main() -> None:
                 for wid, label in wonder_label.items():
                     if (ids == wid).sum() >= 50:
                         eval_metrics[f"wonder/{label}"] = float(wins[ids == wid].mean())
+                if args.side_choice:  # how often each wonder is played on its Night side
+                    for name in sorted({w.name for w in WONDERS}):
+                        day, night = (next(w.id for w in WONDERS if w.name == name and w.side == s)
+                                      for s in ("day", "night"))
+                        n_day, n_night = (ids == day).sum(), (ids == night).sum()
+                        if n_day + n_night >= 50:
+                            eval_metrics[f"side/night_share/{name}"] = float(n_night / (n_day + n_night))
                 wonder_ids.clear()
                 wonder_wins.clear()
                 eval_metrics["perf/eval_sec"] = time.time() - t2

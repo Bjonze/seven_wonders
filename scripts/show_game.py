@@ -23,10 +23,11 @@ def main() -> None:
     parser.add_argument("--players", type=int, default=4)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--seat", type=int, default=0, help="seat whose hands are shown")
+    parser.add_argument("--choose-sides", action="store_true", help="players pick their wonder sides")
     args = parser.parse_args()
 
     model = load_model(args.checkpoint)
-    game = Game(num_players=args.players, seed=args.seed)
+    game = Game(num_players=args.players, seed=args.seed, choose_sides=args.choose_sides)
     bots = [PolicyBot(model) if args.opponents == "policy" or s == args.seat
             else OPPONENTS[args.opponents](seed=s) for s in range(args.players)]
     for s, p in enumerate(game.players):
@@ -37,7 +38,9 @@ def main() -> None:
         for seat in game.active:
             action = bots[seat].act(game, seat, game.legal_actions(seat))
             actions[seat] = action
-            if seat == args.seat:
+            if seat == args.seat and game.phase == "side":
+                print(f"\nseat {seat} chooses {action}")
+            elif seat == args.seat:
                 offered = game.discard if game.phase == HALIKARNASSOS else game.hands[seat]
                 hand = ", ".join(sorted(c.name for c in offered))
                 print(f"\nAge {game.age} turn {game.turn} [{game.phase}] coins {game.players[seat].coins}")

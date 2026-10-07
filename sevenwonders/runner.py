@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from .game import HALIKARNASSOS, Game
+from .game import HALIKARNASSOS, SIDE, Game
 
 
 @dataclass
@@ -28,8 +28,8 @@ class GameResult:
 
 
 def play_game(bots, num_players: int = 4, seed: int | None = None, record: bool = False,
-              wonders=None) -> GameResult:
-    game = Game(num_players=num_players, seed=seed, wonders=wonders)
+              wonders=None, choose_sides: bool = False) -> GameResult:
+    game = Game(num_players=num_players, seed=seed, wonders=wonders, choose_sides=choose_sides)
     decisions: list[Decision] = []
     while not game.over:
         actions = {}
@@ -37,7 +37,7 @@ def play_game(bots, num_players: int = 4, seed: int | None = None, record: bool 
             legal = game.legal_actions(seat)
             action = bots[seat].act(game, seat, legal)
             actions[seat] = action
-            if record:
+            if record and game.phase != SIDE:
                 offered = game.hands[seat] if game.phase != HALIKARNASSOS else game.discard
                 decisions.append(Decision(seat, game.age, game.turn, game.phase,
                                           tuple(c.id for c in offered), action.index))

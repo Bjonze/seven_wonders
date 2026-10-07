@@ -3,8 +3,10 @@
 Seats are arranged in a circle. The left neighbour of seat s is (s - 1) % n and the right
 neighbour is (s + 1) % n. In Ages I and III hands pass left, in Age II they pass right.
 
-Flow: during the PLAY phase every seat chooses an action simultaneously and `step` resolves
-them together. Two wonder powers add single-player phases:
+Flow: with choose_sides=True the game starts in the SIDE phase: wonders are dealt and every
+seat picks Day or Night (simultaneously, before any cards are dealt). Otherwise sides are
+random. During the PLAY phase every seat chooses an action simultaneously and `step`
+resolves them together. Two wonder powers add single-player phases:
   * BABYLON: Babylon (night) plays the 7th card of an Age after everyone's 6th turn.
   * HALIKARNASSOS: Halikarnassos picks a discarded card to build for free at the end of the
     turn in which it built a stage with that power.
@@ -43,6 +45,9 @@ _AVOID = 1000
 _PAY_WEIGHTS = {CHEAPEST: (1, 1), PAY_LEFT: (1, 1 + _AVOID), PAY_RIGHT: (1 + _AVOID, 1)}
 
 PLAY, BABYLON, HALIKARNASSOS, OVER = "play", "babylon", "halikarnassos", "over"
+SIDE = "side"
+SIDES = ("day", "night")
+CHOOSE_SIDE = 3  # action kind of SideChoice
 
 MILITARY_WIN = {1: 1, 2: 3, 3: 5}
 MILITARY_LOSS = -1
@@ -66,6 +71,22 @@ class Action:
     def __repr__(self) -> str:
         suffix = f"({PAY_NAMES[self.pay]})" if self.pay != CHEAPEST else ""
         return f"{ACTION_KIND_NAMES[self.kind]}:{self.card.name}{suffix}"
+
+
+@dataclass(frozen=True)
+class SideChoice:
+    """Pick the Day or Night side of your wonder (SIDE phase)."""
+    side: str
+    kind: int = CHOOSE_SIDE
+    pay: int = CHEAPEST
+    card: None = None
+
+    @property
+    def index(self) -> int:
+        return -1 - SIDES.index(self.side)
+
+    def __repr__(self) -> str:
+        return f"side:{self.side}"
 
 
 def science_points(counts: list[int] | tuple[int, ...], wild: int = 0) -> int:
@@ -192,14 +213,31 @@ class Game:
         num_players: int = 4,
         seed: int | None = None,
         wonders: list[WonderSide] | None = None,
+        choose_sides: bool = False,
+        repeat_wonders: bool = False,
     ):
+        """wonders: fixed boards (no dealing, no side choice). Otherwise wonders are dealt at
+        random: all different (the real game), or with repeat_wonders at least two players
+        get the same wonder (a training variant). With choose_sides the players pick their
+        sides in the SIDE phase; otherwise sides are random."""
         if not 3 <= num_players <= 7:
             raise ValueError("2nd edition base game supports 3-7 players")
         self.n = num_players
         self.rng = random.Random(seed)
+        self._dealt_names: list[str] | None = None
         if wonders is None:
-            names = self.rng.sample(sorted({w.name for w in WONDERS}), num_players)
-            sides = [self.rng.choice(("day", "night")) for _ in names]
+            all_names = sorted({w.name for w in WONDERS})
+            if repeat_wonders:
+                names = [self.rng.choice(all_names) for _ in range(num_players)]
+                while len(set(names)) == num_players:
+                    names = [self.rng.choice(all_names) for _ in range(num_players)]
+            else:
+                names = self.rng.sample(all_names, num_players)
+            if choose_sides:
+                self._dealt_names = names
+                sides = ["day"] * num_players  # placeholders until the SIDE phase
+            else:
+                sides = [self.rng.choice(SIDES) for _ in names]
             wonders = [
                 next(w for w in WONDERS if w.name == name and w.side == side)
                 for name, side in zip(names, sides)
@@ -221,7 +259,11 @@ class Game:
         self._hali_queue: list[int] = []
         self._leftovers_done = False
         self._cache: dict = {}
-        self._start_age(1)
+        if self._dealt_names is not None:
+            self.phase = SIDE
+            self.active = list(range(num_players))
+        else:
+            self._start_age(1)
 
     def clone(self) -> Game:
         """Independent copy of the game (cards and wonders are shared, they never change).
@@ -330,6 +372,8 @@ class Game:
         different (affordable) payment than the cheapest one."""
         if seat not in self.active:
             return []
+        if self.phase == SIDE:
+            return [SideChoice(side) for side in SIDES]
         if self.phase == HALIKARNASSOS:
             return self._hali_options(seat)
         actions = []
@@ -381,7 +425,13 @@ class Game:
         missing = [s for s in self.active if s not in actions]
         if missing:
             raise ValueError(f"missing actions for seats {missing}")
-        if self.phase == PLAY:
+        if self.phase == SIDE:
+            for seat in self.active:
+                side = actions[seat].side
+                name = self._dealt_names[seat]
+                self.players[seat].wonder = next(w for w in WONDERS if w.name == name and w.side == side)
+            self._start_age(1)
+        elif self.phase == PLAY:
             self._resolve_plays({s: actions[s] for s in self.active})
             self._after_play()
         elif self.phase == BABYLON:

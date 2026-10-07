@@ -17,9 +17,9 @@ import random
 import numpy as np
 import torch
 
-from ..game import Game
+from ..game import SIDE, Game
 from .agent import evaluate_games
-from .encoding import SCORE_KEYS, encode, model_encoding
+from .encoding import SCORE_KEYS, encode, model_encoding, random_side
 from .model import PolicyValueNet
 from .priority import lower_priority
 
@@ -56,13 +56,14 @@ def gae(values: np.ndarray, reward: float, gamma: float, lam: float) -> tuple[np
 
 
 def _assign_controllers(num_games: int, num_players: int, num_opponents: int, pool_frac: float,
-                        rng: random.Random) -> list[list[int]]:
-    """controllers[game][seat] = LEARNER or an index into the opponent list."""
+                        rng: random.Random, weights: list[float] | None = None) -> list[list[int]]:
+    """controllers[game][seat] = LEARNER or an index into the opponent list (chosen with
+    probability proportional to `weights`, uniform if None)."""
     controllers = []
     for _ in range(num_games):
         ctrl = [LEARNER] * num_players
         if num_opponents and rng.random() < pool_frac:
-            opponent = rng.randrange(num_opponents)
+            opponent = rng.choices(range(num_opponents), weights=weights)[0]
             for seat in rng.sample(range(num_players), rng.randint(1, num_players - 1)):
                 ctrl[seat] = opponent
         controllers.append(ctrl)
@@ -80,14 +81,23 @@ def collect(
     lam: float = 0.95,
     opponents: list[PolicyValueNet] | None = None,
     pool_frac: float = 0.0,
+    opponent_weights: list[float] | None = None,
+    choose_sides: bool = False,
+    repeat_frac: float = 0.0,
 ) -> dict[str, np.ndarray]:
+    """choose_sides: players pick wonder sides (networks that can't, and pool opponents of
+    older versions, pick at random). repeat_frac: share of games dealt with repeated wonders
+    (a training variant; statistics below only use normal games)."""
     model.eval()
+    rng = random.Random(seed)
     opponents = opponents or []
     nets = {LEARNER: model, **dict(enumerate(opponents))}
     configs = {k: model_encoding(m) for k, m in nets.items()}
-    games = [Game(num_players=num_players, seed=seed + i) for i in range(num_games)]
-    controllers = _assign_controllers(num_games, num_players, len(opponents), pool_frac,
-                                      random.Random(seed))
+    repeated = [rng.random() < repeat_frac for _ in range(num_games)]
+    games = [Game(num_players=num_players, seed=seed + i, choose_sides=choose_sides, repeat_wonders=repeated[i])
+             for i in range(num_games)]
+    controllers = _assign_controllers(num_games, num_players, len(opponents), pool_frac, rng,
+                                      opponent_weights)
     # trajectories[game][seat] = list of step indices into the flat buffers (learner seats)
     trajectories = [[[] for _ in range(num_players)] for _ in games]
     obs_buf, mask_buf, act_buf, logp_buf, val_buf = [], [], [], [], []
@@ -101,6 +111,12 @@ def collect(
             groups.setdefault(controllers[gi][seat], []).append((gi, seat))
         step_actions: dict[int, dict] = {}
         for ctrl, members in groups.items():
+            if not configs[ctrl].side_choice:
+                for gi, seat in [m for m in members if games[m[0]].phase == SIDE]:
+                    step_actions.setdefault(gi, {})[seat] = random_side(rng)
+                members = [m for m in members if games[m[0]].phase != SIDE]
+                if not members:
+                    continue
             encoded = [encode(games[gi], seat, configs[ctrl]) for gi, seat in members]
             obs = torch.from_numpy(np.stack([e[0] for e in encoded]))
             mask = torch.from_numpy(np.stack([e[1] for e in encoded]))
@@ -130,7 +146,7 @@ def collect(
     for gi, g in enumerate(games):
         rewards = terminal_rewards(g, reward_mode)
         wins = terminal_rewards(g, "win")
-        selfplay = all(c == LEARNER for c in controllers[gi])
+        selfplay = all(c == LEARNER for c in controllers[gi]) and not repeated[gi]
         for seat in range(num_players):
             if controllers[gi][seat] != LEARNER:
                 continue
@@ -144,7 +160,7 @@ def collect(
                 trade_paid.append(g.players[seat].trade_paid)
                 wonder_ids.append(g.players[seat].wonder.id)
                 seat_wins.append(wins[seat])
-            else:
+            elif any(c != LEARNER for c in controllers[gi]):
                 pool_opponent.append(max(controllers[gi]))
                 pool_win.append(wins[seat])
 
@@ -163,6 +179,7 @@ def collect(
         "win": np.asarray(seat_wins, dtype=np.float32),
         "pool_opponent": np.asarray(pool_opponent, dtype=np.int64),
         "pool_win": np.asarray(pool_win, dtype=np.float32),
+        "repeated_games": np.asarray([sum(repeated)]),
         "games": np.asarray([num_games]),
     }
 
@@ -195,22 +212,23 @@ def worker_main(conn, num_players: int, model_config: dict, reward_mode: str,
         if cmd == "close":
             break
         if cmd == "collect":
-            weights, seed, num_games, pool, pool_frac = payload
+            weights, seed, num_games, pool, options = payload
             _load(model, weights)
             opponents = [opponent(entry) for entry in pool]
             for key in set(cache) - {entry[0] for entry in pool}:
                 del cache[key]
             conn.send(collect(model, num_games, num_players, seed, reward_mode, gamma, lam,
-                              opponents, pool_frac))
+                              opponents, **options))
         elif cmd == "evaluate":
-            weights, opponent_kind, opponent_ckpt, game_ids, seed = payload
+            weights, opponent_kind, opponent_ckpt, game_ids, seed, choose_sides = payload
             _load(model, weights)
             opponent_model = None
             if opponent_ckpt is not None:
                 opponent_config, opponent_weights = opponent_ckpt
                 opponent_model = PolicyValueNet(**opponent_config)
                 _load(opponent_model, opponent_weights)
-            conn.send(evaluate_games(model, opponent_kind, game_ids, num_players, seed, opponent_model))
+            conn.send(evaluate_games(model, opponent_kind, game_ids, num_players, seed, opponent_model,
+                                     choose_sides))
 
 
 __all__ = ["collect", "worker_main", "terminal_rewards", "gae", "LEARNER"]
