@@ -41,16 +41,21 @@ def min_purchase_cost(
     right_choices: list[tuple[int, ...]],
     left_price: tuple[int, ...],
     right_price: tuple[int, ...],
+    left_weight: int = 1,
+    right_weight: int = 1,
 ) -> tuple[int, int] | None:
-    """Cheapest way to cover `cost` with own production plus purchases from neighbours.
+    """Best way to cover `cost` with own production plus purchases from neighbours.
 
     Each production source covers one unit per turn. Fixed production is single-resource,
     choice sources produce one of several resources. Buying from a neighbour costs
     left_price[r] / right_price[r] coins per unit.
 
-    Returns (coins paid to left neighbour, coins paid to right neighbour) for the cheapest
-    option, or None if the cost cannot be covered. Coin costs printed on cards are not
-    included here.
+    Minimises left_weight * (coins to left) + right_weight * (coins to right). Equal weights
+    give the cheapest option (ties go to the left neighbour); a large weight on one side
+    pays that neighbour as little as possible, then minimises the total.
+
+    Returns (coins paid to left neighbour, coins paid to right neighbour), or None if the
+    cost cannot be covered. Coin costs printed on cards are not included here.
     """
     need = [max(0, c - f) for c, f in zip(cost, own_fixed)]
     if not any(need):
@@ -65,17 +70,18 @@ def min_purchase_cost(
     for opts in right_choices:
         units.append((opts, 2))
 
-    best: list = [None, 10**9]  # [(left, right), total]
+    wl, wr = left_weight, right_weight
+    best: list = [None, 10**12]  # [(left, right), objective]
 
     def finish(need_: list[int], paid_l: int, paid_r: int) -> None:
-        # Cover the rest with neighbours' fixed production, cheapest side first.
+        # Cover the rest with neighbours' fixed production, best weighted side first.
         pl, pr = paid_l, paid_r
         for r in range(NUM_RESOURCES):
             n = need_[r]
             if n == 0:
                 continue
             lp, rp = left_price[r], right_price[r]
-            if lp <= rp:
+            if wl * lp <= wr * rp:
                 take = min(n, left_fixed[r])
                 pl += take * lp
                 n -= take
@@ -91,18 +97,18 @@ def min_purchase_cost(
                 n -= take
             if n > 0:
                 return
-            if pl + pr >= best[1]:
+            if wl * pl + wr * pr >= best[1]:
                 return
-        if pl + pr < best[1]:
+        if wl * pl + wr * pr < best[1]:
             best[0] = (pl, pr)
-            best[1] = pl + pr
+            best[1] = wl * pl + wr * pr
 
     def search(i: int, need_: list[int], paid_l: int, paid_r: int) -> None:
-        if paid_l + paid_r >= best[1]:
+        if wl * paid_l + wr * paid_r >= best[1]:
             return
         if not any(need_):
             best[0] = (paid_l, paid_r)
-            best[1] = paid_l + paid_r
+            best[1] = wl * paid_l + wr * paid_r
             return
         if i == len(units):
             finish(need_, paid_l, paid_r)

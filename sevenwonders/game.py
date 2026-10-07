@@ -34,6 +34,14 @@ BUILD, WONDER, SELL = 0, 1, 2
 NUM_ACTION_KINDS = 3
 ACTION_KIND_NAMES = ("build", "wonder", "sell")
 
+# How to pay for resources bought from neighbours (build and wonder actions)
+CHEAPEST = 0  # lowest total; when both neighbours sell at the same price, buy from the left
+PAY_LEFT = 1  # pay the right neighbour as little as possible (even if it costs more)
+PAY_RIGHT = 2  # pay the left neighbour as little as possible (even if it costs more)
+PAY_NAMES = ("cheapest", "pay-left", "pay-right")
+_AVOID = 1000
+_PAY_WEIGHTS = {CHEAPEST: (1, 1), PAY_LEFT: (1, 1 + _AVOID), PAY_RIGHT: (1 + _AVOID, 1)}
+
 PLAY, BABYLON, HALIKARNASSOS, OVER = "play", "babylon", "halikarnassos", "over"
 
 MILITARY_WIN = {1: 1, 2: 3, 3: 5}
@@ -48,14 +56,16 @@ TURNS_PER_AGE = 6
 class Action:
     kind: int
     card: Card
+    pay: int = CHEAPEST
 
     @property
     def index(self) -> int:
-        """Flat action index: card id * 3 + kind."""
+        """Flat action index ignoring the payment option: card id * 3 + kind."""
         return self.card.id * NUM_ACTION_KINDS + self.kind
 
     def __repr__(self) -> str:
-        return f"{ACTION_KIND_NAMES[self.kind]}:{self.card.name}"
+        suffix = f"({PAY_NAMES[self.pay]})" if self.pay != CHEAPEST else ""
+        return f"{ACTION_KIND_NAMES[self.kind]}:{self.card.name}{suffix}"
 
 
 def science_points(counts: list[int] | tuple[int, ...], wild: int = 0) -> int:
@@ -100,6 +110,8 @@ class Player:
         self.free_last_of_age = False
         self.play_last_card = False
         self.price_left = self.price_right = (2,) * NUM_RESOURCES
+        self.trade_paid = 0  # coins paid to neighbours for resources (statistics only)
+        self.trade_received = 0
 
     # -- state changes -------------------------------------------------------------------
     def add_card(self, card: Card) -> None:
@@ -210,7 +222,7 @@ class Game:
         return self.phase == OVER
 
     # -- payments ------------------------------------------------------------------------
-    def _trade_cost(self, seat: int, cost: tuple[int, ...]) -> tuple[int, int] | None:
+    def _trade_cost(self, seat: int, cost: tuple[int, ...], pay: int = CHEAPEST) -> tuple[int, int] | None:
         p = self.players[seat]
         lp = self.players[self.left(seat)]
         rp = self.players[self.right(seat)]
@@ -218,7 +230,7 @@ class Game:
             cost, p.fixed, p.choices,
             lp.tradeable_fixed, lp.tradeable_choices,
             rp.tradeable_fixed, rp.tradeable_choices,
-            p.price_left, p.price_right,
+            p.price_left, p.price_right, *_PAY_WEIGHTS[pay],
         )
 
     def is_free(self, seat: int, card: Card) -> bool:
@@ -236,16 +248,16 @@ class Game:
                 return True
         return False
 
-    def build_payment(self, seat: int, card: Card) -> tuple[int, int, int] | None:
+    def build_payment(self, seat: int, card: Card, pay: int = CHEAPEST) -> tuple[int, int, int] | None:
         """(coins to bank, coins to left, coins to right) to build `card`, or None."""
-        key = ("b", seat, card.id)
+        key = ("b", seat, card.id, pay)
         if key in self._cache:
             return self._cache[key]
-        result = self._build_payment(seat, card)
+        result = self._build_payment(seat, card, pay)
         self._cache[key] = result
         return result
 
-    def _build_payment(self, seat: int, card: Card) -> tuple[int, int, int] | None:
+    def _build_payment(self, seat: int, card: Card, pay: int) -> tuple[int, int, int] | None:
         p = self.players[seat]
         if card.name in p.names:
             return None
@@ -253,44 +265,72 @@ class Game:
             return (0, 0, 0)
         if card.coin_cost > p.coins:
             return None
-        trade = self._trade_cost(seat, card.cost)
+        trade = self._trade_cost(seat, card.cost, pay)
         if trade is None or card.coin_cost + trade[0] + trade[1] > p.coins:
             return None
         return (card.coin_cost, trade[0], trade[1])
 
-    def wonder_payment(self, seat: int) -> tuple[int, int, int] | None:
-        key = ("w", seat)
+    def wonder_payment(self, seat: int, pay: int = CHEAPEST) -> tuple[int, int, int] | None:
+        key = ("w", seat, pay)
         if key in self._cache:
             return self._cache[key]
         p = self.players[seat]
         stage = p.next_stage()
         result = None
         if stage is not None:
-            trade = self._trade_cost(seat, stage.cost)
+            trade = self._trade_cost(seat, stage.cost, pay)
             if trade is not None and trade[0] + trade[1] <= p.coins:
                 result = (0, trade[0], trade[1])
         self._cache[key] = result
         return result
 
+    def payment(self, seat: int, action: Action) -> tuple[int, int, int] | None:
+        """(coins to bank, coins to left, coins to right) for `action`, or None if illegal."""
+        if action.kind == BUILD:
+            return self.build_payment(seat, action.card, action.pay)
+        if action.kind == WONDER:
+            return self.wonder_payment(seat, action.pay)
+        return (0, 0, 0)
+
     # -- actions -------------------------------------------------------------------------
-    def legal_actions(self, seat: int) -> list[Action]:
+    def legal_actions(self, seat: int, payment_choice: bool = False) -> list[Action]:
+        """Legal actions for `seat`. With payment_choice, build and wonder actions that buy
+        resources also come in "pay-left" / "pay-right" variants when those give a
+        different (affordable) payment than the cheapest one."""
         if seat not in self.active:
             return []
         if self.phase == HALIKARNASSOS:
             return self._hali_options(seat)
         actions = []
-        can_wonder = self.wonder_payment(seat) is not None
+        wonder_pay = self.wonder_payment(seat)
         seen = set()
         for card in self.hands[seat]:
             if card.name in seen:
                 continue
             seen.add(card.name)
-            if self.build_payment(seat, card) is not None:
+            build_pay = self.build_payment(seat, card)
+            if build_pay is not None:
                 actions.append(Action(BUILD, card))
-            if can_wonder:
+                if payment_choice:
+                    actions += self._payment_variants(seat, Action(BUILD, card), build_pay)
+            if wonder_pay is not None:
                 actions.append(Action(WONDER, card))
+                if payment_choice:
+                    actions += self._payment_variants(seat, Action(WONDER, card), wonder_pay)
             actions.append(Action(SELL, card))
         return actions
+
+    def _payment_variants(self, seat: int, base: Action, cheapest: tuple[int, int, int]) -> list[Action]:
+        if cheapest[1] == 0 and cheapest[2] == 0:
+            return []  # nothing bought, nothing to choose
+        variants, seen = [], {cheapest}
+        for pay in (PAY_LEFT, PAY_RIGHT):
+            action = Action(base.kind, base.card, pay)
+            result = self.payment(seat, action)
+            if result is not None and result not in seen:
+                seen.add(result)
+                variants.append(action)
+        return variants
 
     def _hali_options(self, seat: int) -> list[Action]:
         names = self.players[seat].names
@@ -337,12 +377,7 @@ class Game:
         for seat, action in actions.items():
             if action.card not in self.hands[seat]:
                 raise ValueError(f"seat {seat} does not hold {action.card}")
-            if action.kind == BUILD:
-                pay = self.build_payment(seat, action.card)
-            elif action.kind == WONDER:
-                pay = self.wonder_payment(seat)
-            else:
-                pay = (0, 0, 0)
+            pay = self.payment(seat, action)
             if pay is None:
                 raise ValueError(f"illegal action {action} for seat {seat}")
             payments[seat] = pay
@@ -355,6 +390,7 @@ class Game:
             self.hands[seat].remove(action.card)
             bank, to_left, to_right = payments[seat]
             p.coins -= bank + to_left + to_right
+            p.trade_paid += to_left + to_right
             transfers[self.left(seat)] += to_left
             transfers[self.right(seat)] += to_right
             if action.kind == BUILD:
@@ -367,6 +403,7 @@ class Game:
                 p.coins += SELL_COINS
         for seat in range(self.n):
             self.players[seat].coins += transfers[seat]
+            self.players[seat].trade_received += transfers[seat]
         # Immediate effects happen after every card of the turn is in place.
         for seat, card in built:
             self._card_income(seat, card)

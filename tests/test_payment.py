@@ -1,4 +1,4 @@
-from sevenwonders.game import BUILD, Action
+from sevenwonders.game import BUILD, PAY_RIGHT, Action
 from sevenwonders.resources import ZERO, min_purchase_cost, res, res_options
 
 from .helpers import DEFAULT_WONDERS, card, give, make_game
@@ -7,10 +7,10 @@ FULL = (2,) * 7
 
 
 def solve(cost, own=ZERO, own_choices=(), left=ZERO, left_choices=(), right=ZERO,
-          right_choices=(), lp=FULL, rp=FULL):
+          right_choices=(), lp=FULL, rp=FULL, wl=1, wr=1):
     return min_purchase_cost(res(cost), list(own), [res_options(c) for c in own_choices],
                              list(left), [res_options(c) for c in left_choices],
-                             list(right), [res_options(c) for c in right_choices], lp, rp)
+                             list(right), [res_options(c) for c in right_choices], lp, rp, wl, wr)
 
 
 def test_own_production_is_free():
@@ -76,3 +76,46 @@ def test_cannot_afford():
     g = make_game(*DEFAULT_WONDERS)
     g.players[1].coins = 1
     assert g.build_payment(1, card("Baths")) is None
+
+
+def test_weighted_payment_avoids_one_neighbour():
+    cheap_right = (1, 1, 1, 1, 2, 2, 2)
+    # Cheapest buys the ore from the right (1 coin); avoiding the right costs 2.
+    assert solve("O", left=res("O"), right=res("O"), rp=cheap_right) == (0, 1)
+    assert solve("O", left=res("O"), right=res("O"), rp=cheap_right, wr=1001) == (2, 0)
+    # Avoiding a neighbour who is the only seller is impossible: still buys there.
+    assert solve("O", right=res("O"), wr=1001) == (0, 2)
+    # Mixed: two ore needed, left has one, right has two.
+    assert solve("OO", left=res("O"), right=res("OO"), wr=1001) == (2, 2)
+    assert solve("OO", left=res("O"), right=res("OO"), wl=1001) == (0, 4)
+
+
+def test_payment_variants_in_legal_actions():
+    g = make_game(*DEFAULT_WONDERS)
+    # Seat 1 (Rhodos) needs stone for Baths; give both neighbours stone.
+    give(g, 2, "Stone Pit")
+    g.hands[1] = [card("Baths")] + g.hands[1][1:]
+    g._cache.clear()
+    plain = [a for a in g.legal_actions(1) if a.card.name == "Baths" and a.kind == BUILD]
+    assert len(plain) == 1  # without payment choice: only the cheapest
+    variants = [a for a in g.legal_actions(1, payment_choice=True)
+                if a.card.name == "Baths" and a.kind == BUILD]
+    assert {a.pay for a in variants} == {0, PAY_RIGHT}  # cheapest buys left; pay-left is the same
+    assert g.payment(1, Action(BUILD, card("Baths"), PAY_RIGHT)) == (0, 0, 2)
+    before = [p.coins for p in g.players]
+    actions = {s: Action(2, g.hands[s][-1]) for s in range(4)}
+    actions[1] = Action(BUILD, card("Baths"), PAY_RIGHT)
+    g.step(actions)
+    assert g.players[2].coins == before[2] + 3 + 2  # right neighbour sold a card and got paid
+    assert g.players[0].coins == before[0] + 3
+    assert g.players[1].trade_paid == 2 and g.players[2].trade_received == 2
+
+
+def test_variants_only_when_something_is_bought():
+    g = make_game(*DEFAULT_WONDERS)
+    for seat in range(4):
+        for a in g.legal_actions(seat, payment_choice=True):
+            if a.pay != 0:
+                cheapest = g.payment(seat, Action(a.kind, a.card))
+                assert cheapest[1] + cheapest[2] > 0
+                assert g.payment(seat, a) != cheapest

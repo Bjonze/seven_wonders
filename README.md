@@ -33,6 +33,18 @@ run.
 
 Throughput is limited by the CPU (the Python game engine), at roughly 100 games/s per core.
 
+Useful flags:
+- `--low-priority`: games and other programs get the CPU first.
+- `--payment-choice`: the bot also picks how to pay for bought resources: cheapest, pay the
+  left neighbour where possible, or pay the right neighbour where possible. This lets it avoid
+  funding a leading neighbour even when that costs more. It changes the network's outputs, so
+  these models don't mix with models trained without the flag (they can still play each other).
+- `--eval-checkpoint <path>` (repeatable): also evaluate against three copies of an older model.
+- `--anneal-lr`: decay the learning rate linearly to 0.
+- `--no-wandb`: skip Weights & Biases logging.
+
+What every logged metric means: [docs/METRICS.md](docs/METRICS.md).
+
 ## Layout
 - `sevenwonders/cards.py`: Age cards and guilds (2nd edition)
 - `sevenwonders/wonders.py`: all 14 wonder sides

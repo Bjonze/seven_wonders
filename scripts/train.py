@@ -1,6 +1,7 @@
 """PPO self-play training.
 
-    python scripts/train.py --run v2 --iterations 1000 --low-priority --eval-checkpoint checkpoints/v1/latest.pt
+    python scripts/train.py --run v3 --iterations 1000 --low-priority --anneal-lr --payment-choice \
+        --eval-checkpoint checkpoints/v2/latest.pt
 
 Rollouts and evaluation games run on CPU worker processes (one shared policy plays every
 seat); the PPO update runs on the GPU. Metrics go to the console, logs/<run>.log,
@@ -24,7 +25,8 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from sevenwonders.rl.agent import evaluate_games, summarize  # noqa: E402
-from sevenwonders.rl.encoding import NUM_ACTIONS, SCORE_KEYS, obs_dim  # noqa: E402
+from sevenwonders.game import PAY_LEFT, PAY_RIGHT  # noqa: E402
+from sevenwonders.rl.encoding import SCORE_KEYS, action_kind_and_pay, num_actions, obs_dim  # noqa: E402
 from sevenwonders.rl.model import PolicyValueNet  # noqa: E402
 from sevenwonders.rl.ppo import PPOConfig, ppo_update  # noqa: E402
 from sevenwonders.rl.priority import lower_priority  # noqa: E402
@@ -54,8 +56,10 @@ def parse_args():
     p.add_argument("--ent-coef", type=float, default=0.01)
     p.add_argument("--eval-every", type=int, default=10)
     p.add_argument("--eval-games", type=int, default=400, help="games per evaluation opponent")
-    p.add_argument("--eval-checkpoint", default=None,
-                   help="also evaluate against 3 copies of this (older) policy")
+    p.add_argument("--eval-checkpoint", action="append", default=[],
+                   help="also evaluate against 3 copies of this (older) policy; repeatable")
+    p.add_argument("--payment-choice", action="store_true",
+                   help="let the policy choose whom to pay for resources (cheapest / pay-left / pay-right)")
     p.add_argument("--save-every", type=int, default=25)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--resume", default=None, help="checkpoint to continue from")
@@ -123,10 +127,13 @@ class Logger:
             self.wandb.finish()
 
 
-def selfplay_metrics(data: dict[str, np.ndarray], num_players: int) -> dict[str, float]:
+def selfplay_metrics(data: dict[str, np.ndarray], num_players: int,
+                     payment_choice: bool) -> dict[str, float]:
     breakdowns = data["breakdowns"].reshape(-1, num_players, len(SCORE_KEYS))
     total = breakdowns[..., SCORE_KEYS.index("total")]
-    kinds = np.bincount(data["action"] % 3, minlength=3) / len(data["action"])
+    kind, pay = action_kind_and_pay(data["action"], payment_choice)
+    kinds = np.bincount(kind, minlength=3) / len(kind)
+    builds = kind != 2
     out = {
         "selfplay/score_mean": float(total.mean()),
         "selfplay/winner_score_mean": float(total.max(axis=1).mean()),
@@ -134,6 +141,9 @@ def selfplay_metrics(data: dict[str, np.ndarray], num_players: int) -> dict[str,
         "selfplay/frac_build": float(kinds[0]),
         "selfplay/frac_wonder": float(kinds[1]),
         "selfplay/frac_sell": float(kinds[2]),
+        "selfplay/trade_coins_per_player": float(data["trade_paid"].mean()),
+        "selfplay/frac_pay_left": float((pay[builds] == PAY_LEFT).mean()),
+        "selfplay/frac_pay_right": float((pay[builds] == PAY_RIGHT).mean()),
     }
     for i, key in enumerate(SCORE_KEYS):
         if key != "total":
@@ -149,7 +159,8 @@ def main() -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     torch.manual_seed(args.seed)
 
-    model = PolicyValueNet(obs_dim(args.players), NUM_ACTIONS, args.hidden).to(device)
+    pc = args.payment_choice
+    model = PolicyValueNet(obs_dim(args.players, pc), num_actions(pc), args.hidden).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, eps=1e-5)
     start, total_games, wandb_id = 0, 0, None
     if args.resume:
@@ -163,9 +174,9 @@ def main() -> None:
 
     # Fixed opponents for evaluation
     eval_opponents: list[tuple[str, str, tuple | None]] = [("greedy", "greedy", None), ("random", "random", None)]
-    if args.eval_checkpoint:
-        ref = torch.load(args.eval_checkpoint, map_location="cpu", weights_only=False)
-        ref_name = Path(args.eval_checkpoint).parent.name
+    for path in args.eval_checkpoint:
+        ref = torch.load(path, map_location="cpu", weights_only=False)
+        ref_name = Path(path).parent.name
         ref_weights = {k: v.numpy() for k, v in ref["model"].items()}
         eval_opponents.append((ref_name, "checkpoint", (ref["model_config"], ref_weights)))
 
@@ -176,8 +187,8 @@ def main() -> None:
     wandb_id = log.wandb.id if log.wandb is not None else None
     if args.resume:
         log.line(f"resumed from {args.resume} at iteration {start}")
-    log.line(f"device {device}, obs {model.obs_dim}, actions {NUM_ACTIONS}, params {n_params:,}, "
-             f"workers {args.workers}, low priority {args.low_priority}")
+    log.line(f"device {device}, obs {model.obs_dim}, actions {model.num_actions}, params {n_params:,}, "
+             f"workers {args.workers}, low priority {args.low_priority}, payment choice {pc}")
 
     cpu_model = PolicyValueNet(**model.config())
     ckpt_dir = ROOT / "checkpoints" / args.run
@@ -244,7 +255,7 @@ def main() -> None:
                 "progress/total_games": float(total_games),
                 "progress/hours": (time.time() - run_start) / 3600,
             })
-            metrics.update(selfplay_metrics(data, args.players))
+            metrics.update(selfplay_metrics(data, args.players, pc))
             log.metrics(metrics, it)
             log.line(f"it {it:4d} | games {total_games:8d} | {games / t_collect:5.0f} g/s | "
                      f"score {metrics['selfplay/score_mean']:5.1f} | ent {stats['entropy']:.3f} | "

@@ -12,7 +12,7 @@ import torch
 
 from ..game import Game
 from .agent import evaluate_games
-from .encoding import SCORE_KEYS, encode
+from .encoding import SCORE_KEYS, encode, uses_payment_choice
 from .model import PolicyValueNet
 from .priority import lower_priority
 
@@ -57,6 +57,7 @@ def collect(
     lam: float = 0.95,
 ) -> dict[str, np.ndarray]:
     model.eval()
+    payment_choice = uses_payment_choice(model.num_actions)
     games = [Game(num_players=num_players, seed=seed + i) for i in range(num_games)]
     # trajectories[game][seat] = list of step indices into the flat buffers
     trajectories = [[[] for _ in range(num_players)] for _ in games]
@@ -66,7 +67,7 @@ def collect(
         pending = [(gi, seat) for gi, g in enumerate(games) if not g.over for seat in g.active]
         if not pending:
             break
-        encoded = [encode(games[gi], seat) for gi, seat in pending]
+        encoded = [encode(games[gi], seat, payment_choice) for gi, seat in pending]
         obs = torch.from_numpy(np.stack([e[0] for e in encoded]))
         mask = torch.from_numpy(np.stack([e[1] for e in encoded]))
         logits, values = model(obs, mask)
@@ -90,12 +91,13 @@ def collect(
     values = np.asarray(val_buf, dtype=np.float32)
     adv = np.zeros_like(values)
     ret = np.zeros_like(values)
-    breakdowns = []
+    breakdowns, trade_paid = [], []
     for gi, g in enumerate(games):
         rewards = terminal_rewards(g, reward_mode)
         for seat in range(num_players):
             b = g.score_breakdown(seat)
             breakdowns.append([b[k] for k in SCORE_KEYS])
+            trade_paid.append(g.players[seat].trade_paid)
             idx = np.asarray(trajectories[gi][seat], dtype=np.int64)
             a, r = gae(values[idx], rewards[seat], gamma, lam)
             adv[idx] = a
@@ -111,6 +113,7 @@ def collect(
         "ret": ret,
         # one row per (game, seat), games in order: reshape to (games, players, keys)
         "breakdowns": np.asarray(breakdowns, dtype=np.float32),
+        "trade_paid": np.asarray(trade_paid, dtype=np.float32),
         "games": np.asarray([num_games]),
     }
 
