@@ -25,6 +25,11 @@ face-down discard pile, so prefer the v5a rankings.
 an advantage v4 doesn't have. v5a and v5b are equally strong (25% / 26% against each other
 over 2,000 deals).
 
+**Ensembles** (`scripts/ensemble_eval.py`, 2,000 deals each, ±2 points): averaging several
+models' move probabilities helps only slightly. Against 3× v4, v4+v5a+v5b wins 31.1% vs.
+28.3% for v5a alone (+2.8 ± 2.1 on the same deals); against 3× v5a every ensemble stays within
++1 point of 25%. Adding v2 and v3 (given the legal discard view) doesn't help further.
+
 ## Setup
 ```bash
 conda create -n 7wonders python=3.12 -y
