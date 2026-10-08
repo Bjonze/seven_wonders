@@ -269,7 +269,7 @@ def figure_ranking(table: pd.DataFrame, meta: dict, path: Path, theme: str) -> N
     fig.text(0.02, 1 - 0.32 / fig_h, "Which 7 Wonders cards win games?", fontsize=15, fontweight="bold",
              color=t["ink"], ha="left", va="top")
     fig.text(0.02, 1 - 0.68 / fig_h,
-             f"Self-play bot v3, 4 players, {meta['games']:,} games. Bars: how much the bot's value network "
+             f"Self-play bot {meta['bot']}, 4 players, {meta['games']:,} games. Bars: how much the bot's value network "
              "says building\nthe card raises its chance of winning, compared with selling it for 3 coins "
              "(mean, 95% CI).",
              fontsize=9, color=t["secondary"], ha="left", va="top")
@@ -528,7 +528,23 @@ def write_report(out: Path, table: pd.DataFrame, wonders: pd.DataFrame, meta: di
         "",
         "## Wonder sides",
         "",
-        "Win rate of each wonder side in the same self-play games (25% = average).",
+    ]
+    if meta.get("side_choice"):
+        lines += [
+            "The bot picks its own wonder side (Day or Night) at the start, as in the real game. "
+            "How often it picks Night:",
+            "",
+            "| Wonder | Night picked |",
+            "|---|---:|",
+        ]
+        for name, share in sorted(meta["night_share"].items(), key=lambda kv: -kv[1]):
+            lines.append(f"| {name} | {share * 100:.0f}% |")
+        lines += ["", "Win rate of each side in the same self-play games (25% = average). Sides the bot "
+                      "rarely picks have few games, so their numbers are less reliable."]
+    else:
+        lines.append("Win rate of each wonder side in the same self-play games (sides dealt at random; "
+                     "25% = average).")
+    lines += [
         "",
         "| Wonder side | Win rate | Mean score | Seat-games |",
         "|---|---:|---:|---:|",
@@ -575,6 +591,16 @@ def main() -> None:
     if not args.report_only:
         simulate(args, raw_dir)
     table, wonders, meta = build_table(raw_dir)
+    meta["bot"] = args.name
+    import torch
+    model_config = torch.load(args.checkpoint, map_location="cpu", weights_only=False)["model_config"]
+    meta["side_choice"] = bool((model_config.get("encoding") or {}).get("side_choice"))
+    if meta["side_choice"]:
+        seats = np.load(raw_dir / "observe.npz")["seats"]
+        side_of = {w.id: (w.name, w.side) for w in WONDERS}
+        chosen = [side_of[int(w)] for w in seats[:, SEAT_FIELDS.index("wonder")]]
+        meta["night_share"] = {name: float(np.mean([s == "night" for n, s in chosen if n == name]))
+                               for name in sorted({n for n, _ in chosen})}
     (out / "figures").mkdir(parents=True, exist_ok=True)
     table.to_csv(out / "card_rankings.csv", index=False, float_format="%.5f")
     wonders.to_csv(out / "wonders.csv", index=False, float_format="%.5f")

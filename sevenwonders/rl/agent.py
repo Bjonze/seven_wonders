@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import random
 from collections.abc import Iterable
+from dataclasses import replace
 
 import numpy as np
 import torch
@@ -37,6 +38,42 @@ class PolicyBot(Bot):
             probs = torch.softmax(logits[0], dim=-1)
             index = int(torch.multinomial(probs, 1, generator=self.generator))
         return actions[index]
+
+
+class EnsembleBot(Bot):
+    """Plays the move with the highest (weighted) average probability across several models.
+
+    Every model reads the game through its own encoding; actions are matched as game moves,
+    so models with different action layouts can vote together (a model that has no payment
+    choice puts all its weight on the cheapest payment). Models trained with the visible
+    discard pile get the legal face-down view unless censor_legacy is False."""
+
+    name = "ensemble"
+
+    def __init__(self, models: list[PolicyValueNet], weights: list[float] | None = None,
+                 seed: int | None = None, censor_legacy: bool = True):
+        self.members = []
+        for model, weight in zip(models, weights or [1.0] * len(models)):
+            cfg = model_encoding(model)
+            if censor_legacy and not cfg.hidden_discard:
+                cfg = replace(cfg, censor_discard=True)
+            self.members.append((model, cfg, weight))
+        self.rng = random.Random(seed)
+
+    @torch.no_grad()
+    def act(self, game, seat, legal):
+        scores: dict = {}
+        for model, cfg, weight in self.members:
+            if game.phase == SIDE and not cfg.side_choice:
+                continue
+            obs, mask, actions = encode(game, seat, cfg)
+            logits, _ = model(torch.from_numpy(obs)[None], torch.from_numpy(mask)[None])
+            probs = torch.softmax(logits[0], dim=-1)
+            for index, action in actions.items():
+                scores[action] = scores.get(action, 0.0) + weight * float(probs[index])
+        if not scores:  # nobody in the ensemble can choose a side
+            return random_side(self.rng)
+        return max(scores, key=scores.get)
 
 
 OPPONENTS = {"greedy": GreedyBot, "random": RandomBot}

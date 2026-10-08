@@ -44,7 +44,8 @@ def observe(model: PolicyValueNet, seeds: list[int], num_players: int = 4,
     model.eval()
     pc = model_encoding(model)
     generator = torch.Generator().manual_seed(torch_seed)
-    games = [Game(num_players=num_players, seed=s) for s in seeds]
+    # Models that can choose their wonder side play the real setup (they pick sides)
+    games = [Game(num_players=num_players, seed=s, choose_sides=pc.side_choice) for s in seeds]
     rows: list[list[float]] = []
     owner: list[tuple[int, int]] = []  # (game, seat) of each row, to fill in the outcome
 
@@ -127,7 +128,7 @@ def play_forced(model: PolicyValueNet, seeds: list[int], card_name: str, card_ag
     share and whether the opportunity came up."""
     model.eval()
     pc = model_encoding(model)
-    games = [Game(num_players=num_players, seed=s) for s in seeds]
+    games = [Game(num_players=num_players, seed=s, choose_sides=pc.side_choice) for s in seeds]
     forced_seat = [s % num_players for s in seeds]
     opportunity = np.zeros(len(games), dtype=np.float32)
     opportunity_turn = np.zeros(len(games), dtype=np.int64)  # turn of the split (0 = none)

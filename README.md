@@ -5,16 +5,25 @@ self-play reinforcement-learning agent. The goal is to rank cards by how much th
 win.
 
 ## Results
-**[Card rankings (baseline, bot v3)](results/v3/README.md)**: every card's value per Age with
-figures and tables, plus win rates per wonder side.
+**[Card rankings (current, bot v5a)](results/v5a/README.md)**: every card's value per Age
+(overall and in the first vs. second half of the Age), checked against played-out games, plus
+which wonder side the bot picks and how each side does.
 
-| Bot | Games trained | Win rate vs. 3 greedy bots | vs. 3 copies of v1 | vs. 3 copies of v2 |
-|---|---:|---:|---:|---:|
-| v1 | 0.19M | 73% | | |
-| v2 | 1.4M | 81% | 48% | |
-| v3 (payment choice) | 1.4M | 84% | 45% | 24% |
+Earlier: [rankings with bot v3](results/v3/README.md) (tag `baseline-v3`). v3 could see the
+face-down discard pile, so prefer the v5a rankings.
 
-4-player games; 25% = equal strength.
+| Bot | What changed | Games trained | Win rate vs. 3 greedy bots | vs. 3 copies of the previous best |
+|---|---|---:|---:|---:|
+| v1 | first PPO self-play bot | 0.19M | 73% | |
+| v2 | longer training | 1.4M | 81% | 48% (v1) |
+| v3 | chooses whom to pay for resources | 1.4M | 84% | 24% (v2) |
+| v4 | discard pile hidden, 8.5M-parameter network, opponent pool | 5.6M | 87% | 27% (v3)* |
+| **v5a** | picks its wonder side; fine-tuned from v4 | +2.1M | 89% | 29% (v4) |
+| v5b | as v5a + 15% repeated-wonder games | +2.1M | 88% | 28% (v4) |
+
+4-player games; 25% = equal strength. *v3 still sees the discard pile in that comparison,
+an advantage v4 doesn't have. v5a and v5b are equally strong (25% / 26% against each other
+over 2,000 deals).
 
 ## Setup
 ```bash

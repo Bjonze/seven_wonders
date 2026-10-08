@@ -146,7 +146,7 @@ Across cards the estimate and the played-out result correlate with r = 0.85. Dot
 
 ## Wonder sides
 
-Win rate of each wonder side in the same self-play games (25% = average).
+Win rate of each wonder side in the same self-play games (sides dealt at random; 25% = average).
 
 | Wonder side | Win rate | Mean score | Seat-games |
 |---|---:|---:|---:|

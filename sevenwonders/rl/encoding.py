@@ -75,6 +75,9 @@ class EncodingConfig:
     payment_choice: bool = False
     hidden_discard: bool = False
     side_choice: bool = False
+    # Not a training setting: feed a model trained with the visible discard pile (v1-v3) only
+    # the legal view (own discards), keeping its input layout. Used for fair comparisons.
+    censor_discard: bool = False
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -274,7 +277,7 @@ def encode(game: Game, seat: int, cfg: EncodingConfig | bool = False
                 _payment_features(obs, off + 2, 1, wpay, alts)
     off += WONDER_FEATURES[payment_choice]
     picking = game.phase == HALIKARNASSOS and seat in game.active
-    if cfg.hidden_discard and not picking:
+    if (cfg.hidden_discard or cfg.censor_discard) and not picking:
         for card, origin in zip(game.discard, game.discard_origin):
             if origin[0] == seat:
                 obs[off + card.id] += 0.5
