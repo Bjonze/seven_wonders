@@ -130,6 +130,7 @@ def play_forced(model: PolicyValueNet, seeds: list[int], card_name: str, card_ag
     games = [Game(num_players=num_players, seed=s) for s in seeds]
     forced_seat = [s % num_players for s in seeds]
     opportunity = np.zeros(len(games), dtype=np.float32)
+    opportunity_turn = np.zeros(len(games), dtype=np.int64)  # turn of the split (0 = none)
     kind = {"build": BUILD, "sell": SELL}[mode]
     while True:
         pending = [(gi, seat) for gi, g in enumerate(games) if not g.over for seat in g.active]
@@ -147,8 +148,10 @@ def play_forced(model: PolicyValueNet, seeds: list[int], card_name: str, card_ag
                 if target is not None and g.build_payment(seat, target) is not None:
                     action = Action(kind, target, CHEAPEST)
                     opportunity[gi] = 1.0
+                    opportunity_turn[gi] = 7 if g.phase == BABYLON else g.turn
             joint.setdefault(gi, {})[seat] = action
         for gi, acts in joint.items():
             games[gi].step(acts)
     win = np.asarray([win_share(g, forced_seat[gi]) for gi, g in enumerate(games)], dtype=np.float32)
-    return {"seed": np.asarray(seeds), "win": win, "opportunity": opportunity}
+    return {"seed": np.asarray(seeds), "win": win, "opportunity": opportunity,
+            "opportunity_turn": opportunity_turn}

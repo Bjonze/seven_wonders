@@ -30,6 +30,7 @@ from sevenwonders.rl.analysis import OBS_FIELDS, SEAT_FIELDS  # noqa: E402
 from sevenwonders.wonders import WONDERS  # noqa: E402
 
 NUM_PLAYERS = 4
+EARLY_LAST_TURN = 3  # turns 1-3 = first half of an Age, 4-6 (and Babylon's 7th card) = second half
 OBS_SEED = 1_000_000
 FORCED_SEED = 2_000_000
 AGE_LABEL = {1: "I", 2: "II", 3: "III"}
@@ -37,9 +38,9 @@ AGE_LABEL = {1: "I", 2: "II", 3: "III"}
 # Chart tokens (dataviz reference palette): one series -> slot 1 for every bar
 THEMES = {
     "light": dict(surface="#fcfcfb", ink="#0b0b0b", secondary="#52514e", muted="#898781",
-                  grid="#e1e0d9", baseline="#c3c2b7", bar="#2a78d6"),
+                  grid="#e1e0d9", baseline="#c3c2b7", bar="#2a78d6", late="#eb6834"),
     "dark": dict(surface="#1a1a19", ink="#ffffff", secondary="#c3c2b7", muted="#898781",
-                 grid="#2c2c2a", baseline="#383835", bar="#3987e5"),
+                 grid="#2c2c2a", baseline="#383835", bar="#3987e5", late="#d95926"),
 }
 
 
@@ -108,18 +109,22 @@ def simulate(args, raw_dir: Path) -> None:
                  for c in chunks(fseeds, 250)]
         win = {m: np.zeros((len(entries), len(fseeds)), dtype=np.float32) for m in ("build", "sell")}
         opportunity = {m: np.zeros_like(win[m]) for m in win}
+        opp_turn = {m: np.zeros(win[m].shape, dtype=np.int64) for m in win}
         index = {e: i for i, e in enumerate(entries)}
         for k, (name, age, mode, out) in enumerate(pool.imap_unordered(_forced_task, tasks), 1):
             cols = out["seed"] - FORCED_SEED
             win[mode][index[(name, age)], cols] = out["win"]
             opportunity[mode][index[(name, age)], cols] = out["opportunity"]
+            opp_turn[mode][index[(name, age)], cols] = out["opportunity_turn"]
             if k % 50 == 0:
                 print(f"  build/sell tasks {k}/{len(tasks)} ({time.time() - t0:.0f}s)", flush=True)
         # Both runs are identical up to the opportunity, so it must come up in the same games
         assert np.array_equal(opportunity["build"], opportunity["sell"])
+        assert np.array_equal(opp_turn["build"], opp_turn["sell"])
         np.savez_compressed(raw_dir / "forced.npz", names=np.asarray([n for n, _ in entries]),
                             ages=np.asarray([a for _, a in entries]), win_build=win["build"],
-                            win_sell=win["sell"], opportunity=opportunity["build"])
+                            win_sell=win["sell"], opportunity=opportunity["build"],
+                            opportunity_turn=opp_turn["build"])
         print(f"build/sell games done in {time.time() - t0:.0f}s", flush=True)
 
 
@@ -138,6 +143,7 @@ def build_table(raw_dir: Path) -> tuple[pd.DataFrame, pd.DataFrame, dict]:
     forced = np.load(raw_dir / "forced.npz")
     f_index = {(str(n), int(a)): i for i, (n, a) in enumerate(zip(forced["names"], forced["ages"]))}
 
+    has_turns = "opportunity_turn" in forced.files
     color_of = {(c.name, c.age): c.color for c in ALL_CARDS}
     records = []
     for (card_id, age), g in rows.groupby(["card", "age"]):
@@ -146,9 +152,18 @@ def build_table(raw_dir: Path) -> tuple[pd.DataFrame, pd.DataFrame, dict]:
         b = g[g.buildable == 1]
         gain, gain_se = mean_se((b.q_build - b.q_sell).to_numpy())
         best, best_se = mean_se((b.q_build - b.q_best_other).to_numpy())
+        early_rows, late_rows = b[b.turn <= EARLY_LAST_TURN], b[b.turn > EARLY_LAST_TURN]
+        early, early_se = mean_se((early_rows.q_build - early_rows.q_sell).to_numpy())
+        late, late_se = mean_se((late_rows.q_build - late_rows.q_sell).to_numpy())
         fi = f_index[(name, age)]
         seen = forced["opportunity"][fi] == 1
-        played, played_se = mean_se((forced["win_build"][fi] - forced["win_sell"][fi])[seen])
+        diff = forced["win_build"][fi] - forced["win_sell"][fi]
+        played, played_se = mean_se(diff[seen])
+        played_early = played_late = (float("nan"), float("nan"))
+        if has_turns:
+            turn = forced["opportunity_turn"][fi]
+            played_early = mean_se(diff[seen & (turn <= EARLY_LAST_TURN)])
+            played_late = mean_se(diff[seen & (turn > EARLY_LAST_TURN)])
         color = color_of[(name, age)]
         records.append({
             "card": name,
@@ -156,6 +171,14 @@ def build_table(raw_dir: Path) -> tuple[pd.DataFrame, pd.DataFrame, dict]:
             "type": "guild" if color == PURPLE else COLOR_NAMES[color],
             "gain_vs_sell": gain,
             "gain_vs_sell_se": gain_se,
+            "gain_early": early,
+            "gain_early_se": early_se,
+            "gain_late": late,
+            "gain_late_se": late_se,
+            "buildable_early": len(early_rows),
+            "buildable_late": len(late_rows),
+            "pick_rate_early": float(early_rows.built.mean()) if len(early_rows) else float("nan"),
+            "pick_rate_late": float(late_rows.built.mean()) if len(late_rows) else float("nan"),
             "gain_vs_best": best,
             "gain_vs_best_se": best_se,
             "pick_rate": float(b.built.mean()) if len(b) else float("nan"),
@@ -164,6 +187,10 @@ def build_table(raw_dir: Path) -> tuple[pd.DataFrame, pd.DataFrame, dict]:
             "played_gain": played,
             "played_gain_se": played_se,
             "played_games": int(seen.sum()),
+            "played_gain_early": played_early[0],
+            "played_gain_early_se": played_early[1],
+            "played_gain_late": played_late[0],
+            "played_gain_late_se": played_late[1],
             "times_offered": len(g),
             "times_buildable": len(b),
         })
@@ -178,6 +205,7 @@ def build_table(raw_dir: Path) -> tuple[pd.DataFrame, pd.DataFrame, dict]:
     meta = {
         "games": int(seats.game.nunique()),
         "forced_games": int(forced["win_build"].shape[1]),
+        "played_split": has_turns,
     }
     return table, wonders, meta
 
@@ -246,6 +274,72 @@ def figure_ranking(table: pd.DataFrame, meta: dict, path: Path, theme: str) -> N
              "(mean, 95% CI).",
              fontsize=9, color=t["secondary"], ha="left", va="top")
     fig.subplots_adjust(left=0.30, right=0.97, top=1 - 1.25 / fig_h, bottom=0.55 / fig_h)
+    fig.savefig(path, dpi=160)
+    plt.close(fig)
+
+
+def figure_timing(table: pd.DataFrame, meta: dict, path: Path, theme: str) -> None:
+    """Dumbbell chart: gain vs. selling in the first half (turns 1-3) and second half
+    (turns 4-6) of the Age, cards in the same order as the main ranking."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.lines import Line2D
+
+    t = THEMES[theme]
+    _style(plt, t)
+    counts = [int((table.age == a).sum()) for a in (1, 2, 3)]
+    row_h = 0.215
+    fig_h = 2.05 + sum(counts) * row_h + 3 * 0.3
+    fig, axes = plt.subplots(3, 1, figsize=(9.5, fig_h), sharex=True,
+                             gridspec_kw={"height_ratios": counts, "hspace": 0.09})
+    vals = np.concatenate([table.gain_early.to_numpy(), table.gain_late.to_numpy()]) * 100
+    lo, hi = min(0.0, np.nanmin(vals)) - 0.5, np.nanmax(vals) + 2.8
+    for ax, age in zip(axes, (1, 2, 3)):
+        sub = table[table.age == age].sort_values("gain_vs_sell", ascending=True)
+        y = np.arange(len(sub))
+        early = sub.gain_early.to_numpy() * 100
+        late = sub.gain_late.to_numpy() * 100
+        ax.hlines(y, np.minimum(early, late), np.maximum(early, late), color=t["baseline"], linewidth=2, zorder=2)
+        # Late dot larger and underneath, so it still shows as a ring when the two coincide
+        ax.scatter(late, y, s=50, color=t["late"], edgecolors=t["surface"], linewidths=1.2, zorder=3)
+        ax.scatter(early, y, s=22, color=t["bar"], edgecolors=t["surface"], linewidths=1.0, zorder=4)
+        ax.set_yticks(y, sub.card.tolist())
+        ax.tick_params(axis="y", length=0, pad=4)
+        ax.tick_params(axis="x", length=0)
+        for yi, typ in zip(y, sub.type):
+            ax.text(-0.36, yi, typ, transform=ax.get_yaxis_transform(), ha="left", va="center",
+                    color=t["muted"], fontsize=8)
+        ax.axvline(0, color=t["baseline"], linewidth=1, zorder=1)
+        ax.grid(axis="x", color=t["grid"], linewidth=0.6, zorder=0)
+        for side in ("top", "right", "left", "bottom"):
+            ax.spines[side].set_visible(False)
+        ax.set_ylim(-0.7, len(sub) - 0.3)
+        ax.set_xlim(lo, hi)
+        ax.text(-0.36, 1.0, f"Age {AGE_LABEL[age]}", transform=ax.transAxes, ha="left", va="bottom",
+                fontsize=11, fontweight="bold", color=t["ink"])
+        # Selective direct labels: the biggest shift towards late and towards early (if any)
+        shift = late - early
+        picks = []
+        if np.nanmax(shift) > 0:
+            picks.append(int(np.nanargmax(shift)))
+        if np.nanmin(shift) < 0:
+            picks.append(int(np.nanargmin(shift)))
+        for i in picks:
+            ax.text(max(early[i], late[i]) + 0.35, y[i], f"{shift[i]:+.1f} late vs. early", va="center",
+                    ha="left", fontsize=8, color=t["secondary"])
+    axes[-1].set_xlabel("Win-chance gain from building the card instead of selling it (percentage points)")
+    fig.text(0.02, 1 - 0.32 / fig_h, "When is each card strong?", fontsize=15, fontweight="bold",
+             color=t["ink"], ha="left", va="top")
+    fig.text(0.02, 1 - 0.68 / fig_h,
+             f"Same measure as the main ranking, split by when in the Age the card could be built "
+             f"(self-play bot, {meta['games']:,} games).\nCards in the same order as the main ranking.",
+             fontsize=9, color=t["secondary"], ha="left", va="top")
+    handles = [Line2D([], [], marker="o", linestyle="", markersize=5.5, color=t["bar"], label="Turns 1–3"),
+               Line2D([], [], marker="o", linestyle="", markersize=8, color=t["late"], label="Turns 4–6")]
+    fig.legend(handles=handles, loc="upper left", bbox_to_anchor=(0.015, 1 - 1.0 / fig_h), ncol=2,
+               frameon=False, fontsize=9, labelcolor=t["ink"], handletextpad=0.3, columnspacing=1.5)
+    fig.subplots_adjust(left=0.30, right=0.97, top=1 - 1.75 / fig_h, bottom=0.55 / fig_h)
     fig.savefig(path, dpi=160)
     plt.close(fig)
 
@@ -349,6 +443,39 @@ def write_report(out: Path, table: pd.DataFrame, wonders: pd.DataFrame, meta: di
         "",
         picture("card_value", "Win-chance gain per card, by Age"),
         "",
+        "## When is each card strong?",
+        "",
+        "The same measure, split by when in the Age the card could be built: the first half (turns 1–3) or "
+        "the second half (turns 4–6, including Babylon's extra 7th card).",
+        "",
+        picture("card_timing", "Win-chance gain per card in the first and second half of each Age"),
+        "",
+    ]
+    for age in (1, 2, 3):
+        sub = table[(table.age == age) & (table.buildable_early >= 300) & (table.buildable_late >= 300)].copy()
+        sub["shift"] = sub.gain_late - sub.gain_early
+        later = sub.sort_values("shift", ascending=False).head(3)
+        earlier = sub[sub["shift"] < 0].sort_values("shift").head(3)
+        fmt = lambda df: ", ".join(f"{c} ({pp(s)})" for c, s in zip(df.card, df["shift"]))  # noqa: E731
+        if len(earlier):
+            other = f"stronger early: {fmt(earlier)}"
+        else:
+            other = f"no card is stronger early; least gain from waiting: {fmt(sub.sort_values('shift').head(3))}"
+        lines.append(f"- **Age {AGE_LABEL[age]}:** stronger late: {fmt(later)}; {other}")
+    lines += [
+        "",
+        "Numbers in brackets: late minus early, in percentage points. Only cards that could be built at least "
+        "300 times in each half are listed.",
+        "",
+        "Late decisions tend to swing the win chance more in general, because fewer turns remain for anyone to "
+        "respond (most visible in Age III, where nearly every card gains late). So compare a card's shift with "
+        "the other cards of the same Age rather than with zero.",
+    ]
+    if meta.get("played_split"):
+        lines += ["", "The played-out check is split the same way in `card_rankings.csv` "
+                      "(`played_gain_early` / `played_gain_late`)."]
+    lines += [
+        "",
         "## How to read this",
         "",
         "| Column | Meaning |",
@@ -357,6 +484,7 @@ def write_report(out: Path, table: pd.DataFrame, wonders: pd.DataFrame, meta: di
         "rates the position after building it and after selling it for 3 coins (other players' moves that turn "
         "unchanged). The difference is the change in the bot's estimated chance of winning, in percentage points, "
         "averaged over all those decisions, ± 95% CI. |",
+        "| **Early / Late** | Gain vs. sell, only counting decisions in turns 1–3 / turns 4–6 of the Age. |",
         "| **Gain vs. best other** | Same, but compared with the best other option in that hand (building another "
         "card, a wonder stage, selling). Negative = usually something else in the hand was better. |",
         "| **Pick rate** | How often the bot builds the card when it is in its hand and affordable. |",
@@ -374,15 +502,16 @@ def write_report(out: Path, table: pd.DataFrame, wonders: pd.DataFrame, meta: di
         lines += [
             f"## Age {AGE_LABEL[age]}",
             "",
-            "| # | Card | Type | Gain vs. sell | Gain vs. best other | Pick rate | Win% built / passed | "
-            "Played out | Offered |",
-            "|---:|---|---|---:|---:|---:|---:|---:|---:|",
+            "| # | Card | Type | Gain vs. sell | Early | Late | Gain vs. best other | Pick rate | "
+            "Win% built / passed | Played out | Offered |",
+            "|---:|---|---|---:|---:|---:|---:|---:|---:|---:|---:|",
         ]
         for row in sub.itertuples():
             forced = (f"{pp(row.played_gain, row.played_gain_se)} (n={row.played_games:,})"
                       if row.played_games >= 30 else "–")
             lines.append(
                 f"| {row.rank_in_age} | {row.card} | {row.type} | {pp(row.gain_vs_sell, row.gain_vs_sell_se)} | "
+                f"{pp(row.gain_early)} | {pp(row.gain_late)} | "
                 f"{pp(row.gain_vs_best)} | {row.pick_rate * 100:.0f}% | "
                 f"{row.win_if_built * 100:.0f}% / {row.win_if_passed * 100:.0f}% | {forced} | "
                 f"{row.times_offered:,} |")
@@ -452,6 +581,7 @@ def main() -> None:
     r = 0.0
     for theme in THEMES:
         figure_ranking(table, meta, out / "figures" / f"card_value_{theme}.png", theme)
+        figure_timing(table, meta, out / "figures" / f"card_timing_{theme}.png", theme)
         r = figure_agreement(table, out / "figures" / f"measures_agreement_{theme}.png", theme)
     write_report(out, table, wonders, meta, r, Path(args.checkpoint).as_posix())
     print(f"wrote {out}")
