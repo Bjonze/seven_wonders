@@ -49,7 +49,7 @@ from sevenwonders.rl.encoding import (  # noqa: E402
     SCORE_KEYS, EncodingConfig, action_kind_and_pay, num_actions, obs_dim,
 )
 from sevenwonders.rl.model import PolicyValueNet, warm_start  # noqa: E402
-from sevenwonders.rl.ppo import PPOConfig, ppo_update  # noqa: E402
+from sevenwonders.rl.ppo import PPOConfig, all_finite, ppo_update  # noqa: E402
 from sevenwonders.rl.priority import keep_awake, lower_priority  # noqa: E402
 from sevenwonders.rl.rollout import collect, worker_main  # noqa: E402
 from sevenwonders.wonders import WONDERS  # noqa: E402
@@ -388,6 +388,9 @@ def main() -> None:
         }
 
     def save(iteration: int) -> None:
+        if not all_finite(model):
+            log.line(f"NOT saving iteration {iteration}: the model has non-finite weights")
+            return
         s = state(iteration)
         atomic_save(s, ckpt_dir / "latest.pt")
         atomic_save(s, ckpt_dir / f"iter_{iteration:05d}.pt")
@@ -400,6 +403,7 @@ def main() -> None:
     wonder_ids: list[np.ndarray] = []
     run_start = time.time()
     last_done, last_saved = start - 1, start - 1
+    crashed = False
     try:
         for it in range(start, args.iterations):
             if args.anneal_lr:
@@ -427,6 +431,8 @@ def main() -> None:
 
             t1 = time.time()
             stats = ppo_update(model, optimizer, data, cfg, device)
+            if not all_finite(model):
+                raise FloatingPointError(f"non-finite weights after the update of iteration {it}")
             t_update = time.time() - t1
 
             games = int(data["games"].sum())
@@ -487,7 +493,8 @@ def main() -> None:
                 value = eval_metrics.get(best["metric"])
                 if value is not None and value > best["value"]:
                     best.update(value=float(value), iteration=it)
-                    atomic_save(state(it), ckpt_dir / "best.pt")
+                    if all_finite(model):
+                        atomic_save(state(it), ckpt_dir / "best.pt")
                     parts.append(f"new best {best['metric']} = {value:.3f}")
                 eval_metrics["progress/best"] = best["value"]
                 log.metrics(eval_metrics, it)
@@ -496,9 +503,16 @@ def main() -> None:
                 save(it)
                 last_saved = it
     except (KeyboardInterrupt, EOFError, ConnectionError) as exc:
+        # Interrupted from outside (Ctrl+C, shutdown): the model is fine, save it below
         log.line(f"interrupted ({type(exc).__name__}) after iteration {last_done}")
+    except Exception as exc:
+        # A crash may have left the model half-updated or broken: keep the last good files
+        crashed = True
+        log.line(f"crashed ({type(exc).__name__}: {exc}); not saving, resume from the last "
+                 f"checkpoint (iteration {last_saved})")
+        raise
     finally:
-        if last_done > last_saved:
+        if not crashed and last_done > last_saved:
             save(last_done)
             log.line(f"saved checkpoint at iteration {last_done}")
         for conn, proc in workers:

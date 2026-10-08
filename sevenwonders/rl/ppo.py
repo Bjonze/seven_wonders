@@ -32,28 +32,41 @@ def ppo_update(model: PolicyValueNet, optimizer: torch.optim.Optimizer,
     adv_all = torch.from_numpy(data["adv"]).to(device)
     ret = torch.from_numpy(data["ret"]).to(device)
     n = obs.shape[0]
+    # Minibatch boundaries; a short remainder is merged into the last full minibatch, so no
+    # minibatch is tiny (a 1-sample minibatch makes the advantage std NaN).
+    bounds = list(range(0, n, cfg.minibatch)) + [n]
+    if len(bounds) > 2 and bounds[-1] - bounds[-2] < cfg.minibatch // 4:
+        del bounds[-2]
 
     stats = {"policy_loss": [], "value_loss": [], "entropy": [], "approx_kl": [], "clip_frac": []}
+    skipped = 0
     stop = False
     for _ in range(cfg.epochs):
         perm = torch.randperm(n, device=device)
-        for start in range(0, n, cfg.minibatch):
-            idx = perm[start:start + cfg.minibatch]
+        for start, end in zip(bounds[:-1], bounds[1:]):
+            idx = perm[start:end]
             logits, value = model(obs[idx], mask[idx])
             dist = torch.distributions.Categorical(logits=logits)
             logp = dist.log_prob(act[idx])
             log_ratio = logp - old_logp[idx]
             ratio = log_ratio.exp()
             adv = adv_all[idx]
-            adv = (adv - adv.mean()) / (adv.std() + 1e-8)
+            adv = (adv - adv.mean()) / (adv.std() + 1e-8) if len(idx) > 1 else adv - adv.mean()
             pg_loss = -torch.min(ratio * adv, ratio.clamp(1 - cfg.clip, 1 + cfg.clip) * adv).mean()
             v_loss = 0.5 * (value - ret[idx]).pow(2).mean()
             entropy = dist.entropy().mean()
             loss = pg_loss + cfg.vf_coef * v_loss - cfg.ent_coef * entropy
 
             optimizer.zero_grad(set_to_none=True)
+            if not torch.isfinite(loss):
+                skipped += 1  # never apply a non-finite update
+                continue
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.max_grad_norm)
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.max_grad_norm)
+            if not torch.isfinite(grad_norm):
+                optimizer.zero_grad(set_to_none=True)
+                skipped += 1
+                continue
             optimizer.step()
 
             with torch.no_grad():
@@ -69,6 +82,11 @@ def ppo_update(model: PolicyValueNet, optimizer: torch.optim.Optimizer,
                 break
         if stop:
             break
-    out = {k: float(np.mean(v)) for k, v in stats.items()}
+    out = {k: float(np.mean(v)) if v else float("nan") for k, v in stats.items()}
     out["updates"] = len(stats["policy_loss"])
+    out["skipped_updates"] = skipped
     return out
+
+
+def all_finite(model: torch.nn.Module) -> bool:
+    return all(bool(torch.isfinite(p).all()) for p in model.parameters())
